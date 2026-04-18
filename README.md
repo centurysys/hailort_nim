@@ -92,7 +92,7 @@ nim c -r examples/infer_raw.nim -- model.hef examples/dog.raw
 
 ## License
 
-MIT (TBD)
+MIT
 
 ---
 
