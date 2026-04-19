@@ -41,7 +41,7 @@ proc withTrace(err: HailoError, where: static[string]): HailoError {.inline.} =
 # ------------------------------------------------------------------------------
 proc trace*[T](res: HE[T], where: static[string]): HE[T] {.inline.} =
   if res.isErr:
-    result = err(res.HailoError.withTrace(where))
+    result = err(res.error.withTrace(where))
   else:
     result = res
 
@@ -50,7 +50,7 @@ proc trace*[T](res: HE[T], where: static[string]): HE[T] {.inline.} =
 # ------------------------------------------------------------------------------
 proc errStatus*[T](res: HE[T]): hailo_status =
   if res.isErr:
-    result = res.HailoError.status
+    result = res.error.status
   else:
     result = HAILO_SUCCESS
 
@@ -59,7 +59,7 @@ proc errStatus*[T](res: HE[T]): hailo_status =
 # ------------------------------------------------------------------------------
 proc errMsg*[T](res: HE[T]): string =
   if res.isErr:
-    result = res.HailoError.msg
+    result = res.error.msg
   else:
     result = "No HailoError"
 
