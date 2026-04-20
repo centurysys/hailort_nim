@@ -4,5 +4,4 @@ import ./lowlevel/[
 ]
 import ./internal/error
 export c_api, types
-export device, hef, network_group, stream, vdevice, vstream
-export error except okVoid, makeError
+export device, error, hef, network_group, stream, vdevice, vstream
