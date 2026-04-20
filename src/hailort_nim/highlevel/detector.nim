@@ -83,6 +83,58 @@ proc outputSize*(d: Detector): int {.inline.} =
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
+proc inputMetadata*(d: Detector): HE[VStreamMetadata] =
+  if d.isNil:
+    return makeError(HAILO_INVALID_ARGUMENT, "detector is nil").err
+  result = d.inputInfo.metadata().ok
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc outputMetadata*(d: Detector): HE[VStreamMetadata] =
+  if d.isNil:
+    return makeError(HAILO_INVALID_ARGUMENT, "detector is nil").err
+  result = d.outputInfo.metadata().ok
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc inputShape*(d: Detector): HE[ImageShape] =
+  let mdRes = d.inputMetadata()
+  if mdRes.isErr:
+    return mdRes.error.err
+  result = mdRes.get.shape.ok
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc outputShape*(d: Detector): HE[ImageShape] =
+  let mdRes = d.outputMetadata()
+  if mdRes.isErr:
+    return mdRes.error.err
+  result = mdRes.get.shape.ok
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc inputPixelFormat*(d: Detector): HE[PixelFormat] =
+  let mdRes = d.inputMetadata()
+  if mdRes.isErr:
+    return mdRes.error.err
+  result = mdRes.get.pixelFormat.ok
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc outputPixelFormat*(d: Detector): HE[PixelFormat] =
+  let mdRes = d.outputMetadata()
+  if mdRes.isErr:
+    return mdRes.error.err
+  result = mdRes.get.pixelFormat.ok
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
 proc close*(d: Detector): HE[void] =
   if d.isNil:
     return okVoid()
@@ -285,14 +337,28 @@ proc open*(_: typedesc[Detector], hefPath: string, hailoNmsScoreThreshold = -1.0
 proc inferRaw*(d: Detector; input: openArray[byte]): HE[seq[byte]] =
   if d.isNil:
     return makeError(HAILO_INVALID_ARGUMENT, "detector is nil").err
-  if input.len != d.inputFrameSize:
-    return makeError(
-      HAILO_INVALID_ARGUMENT,
-      &"input size mismatch: expected {d.inputFrameSize}, got {input.len}"
-    ).err
+
+  let validateRes = validateInputBuffer(d.inputInfo, input.len)
+  if validateRes.isErr:
+    return validateRes.error.err
+
   let writeRes = d.inputVstream.write(input)
   if writeRes.isErr:
     return writeRes.error.err
+
+  result = d.outputVstream.read(d.outputFrameSize)
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc inferNhwc4*(d: Detector; input: openArray[byte]): HE[seq[byte]] =
+  if d.isNil:
+    return makeError(HAILO_INVALID_ARGUMENT, "detector is nil").err
+
+  let writeRes = d.inputVstream.writeNhwc4(input)
+  if writeRes.isErr:
+    return writeRes.error.err
+
   result = d.outputVstream.read(d.outputFrameSize)
 
 # ------------------------------------------------------------------------------
@@ -310,6 +376,35 @@ proc detectNmsByClass*(d: Detector, input: openArray[byte],
     ).err
 
   let rawRes = d.inferRaw(input)
+  if rawRes.isErr:
+    return rawRes.error.err
+
+  let nmsShape = d.outputInfo.anon0.nms_shape
+  let numClasses = int(nmsShape.number_of_classes)
+  let maxBoxes = int(nmsShape.max_bboxes_per_class)
+
+  var detections = parseNmsByClassVariable(rawRes.get, numClasses, maxBoxes)
+  if appScoreThreshold > 0:
+    detections = detections.filterIt(it.score >= appScoreThreshold)
+
+  detections.sortByScoreDesc()
+  result = detections.ok
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc detectNmsByClassNhwc4*(d: Detector, input: openArray[byte],
+    appScoreThreshold = 0.25'f32): HE[seq[Detection]] =
+  if d.isNil:
+    return makeError(HAILO_INVALID_ARGUMENT, "detector is nil").err
+
+  if d.outputInfo.format.order != HAILO_FORMAT_ORDER_HAILO_NMS_BY_CLASS:
+    return makeError(
+      HAILO_INVALID_OPERATION,
+      &"output format is not HAILO_FORMAT_ORDER_HAILO_NMS_BY_CLASS: got {ord(d.outputInfo.format.order)}"
+    ).err
+
+  let rawRes = d.inferNhwc4(input)
   if rawRes.isErr:
     return rawRes.error.err
 

@@ -1,4 +1,6 @@
+import std/strutils
 import ./network_group
+import ./common/vstream_types
 import ../bindings/[c_api, types]
 import ../internal/[error, helper]
 
@@ -9,15 +11,12 @@ type
   InputVStreamObj* = object
     raw*: hailo_input_vstream
   InputVStream* = ref InputVStreamObj
-
   OutputVStreamObj* = object
     raw*: hailo_output_vstream
   OutputVStream* = ref OutputVStreamObj
-
   InputVStreamsObj* = object
     raws*: seq[hailo_input_vstream]
   InputVStreams* = ref InputVStreamsObj
-
   OutputVStreamsObj* = object
     raws*: seq[hailo_output_vstream]
   OutputVStreams* = ref OutputVStreamsObj
@@ -49,6 +48,294 @@ proc name*(param: InputVstreamParamsByName): string =
 # ------------------------------------------------------------------------------
 proc name*(param: OutputVstreamParamsByName): string =
   cCharArrayToString(param.name)
+
+# ==============================================================================
+# Format / shape helpers
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc tensorDataType*(fmt: Format): TensorDataType =
+  result = case fmt.type_field
+    of HAILO_FORMAT_TYPE_AUTO:
+      tdtAuto
+    of HAILO_FORMAT_TYPE_UINT8:
+      tdtUint8
+    of HAILO_FORMAT_TYPE_UINT16:
+      tdtUint16
+    of HAILO_FORMAT_TYPE_FLOAT32:
+      tdtFloat32
+    else:
+      tdtUnknown
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc pixelFormat*(fmt: Format): PixelFormat =
+  result = case fmt.order
+    of HAILO_FORMAT_ORDER_AUTO:
+      pfAuto
+    of HAILO_FORMAT_ORDER_NHWC:
+      pfNhwc
+    of HAILO_FORMAT_ORDER_NHCW:
+      pfNhcw
+    of HAILO_FORMAT_ORDER_NCHW:
+      pfNchw
+    of HAILO_FORMAT_ORDER_NHW:
+      pfNhw
+    of HAILO_FORMAT_ORDER_NC:
+      pfNc
+    of HAILO_FORMAT_ORDER_RGB888:
+      pfRgb888
+    of HAILO_FORMAT_ORDER_RGB4:
+      pfRgb4
+    of HAILO_FORMAT_ORDER_NV12:
+      pfNv12
+    of HAILO_FORMAT_ORDER_NV21:
+      pfNv21
+    of HAILO_FORMAT_ORDER_YUY2:
+      pfYuy2
+    of HAILO_FORMAT_ORDER_I420:
+      pfI420
+    of HAILO_FORMAT_ORDER_FCR:
+      pfFcr
+    of HAILO_FORMAT_ORDER_F8CR:
+      pfF8cr
+    of HAILO_FORMAT_ORDER_BAYER_RGB:
+      pfBayerRgb
+    of HAILO_FORMAT_ORDER_12_BIT_BAYER_RGB:
+      pf12BitBayerRgb
+    of HAILO_FORMAT_ORDER_HAILO_NMS:
+      pfHailoNms
+    of HAILO_FORMAT_ORDER_HAILO_NMS_WITH_BYTE_MASK:
+      pfHailoNmsWithByteMask
+    of HAILO_FORMAT_ORDER_HAILO_NMS_ON_CHIP:
+      pfHailoNmsOnChip
+    of HAILO_FORMAT_ORDER_HAILO_NMS_BY_CLASS:
+      pfHailoNmsByClass
+    of HAILO_FORMAT_ORDER_HAILO_NMS_BY_SCORE:
+      pfHailoNmsByScore
+    of HAILO_FORMAT_ORDER_HAILO_YYUV:
+      pfHailoYyuv
+    of HAILO_FORMAT_ORDER_HAILO_YYVU:
+      pfHailoYyvu
+    of HAILO_FORMAT_ORDER_HAILO_YYYYUV:
+      pfHailoYyyyuv
+    else:
+      pfUnknown
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc dataTypeName*(kind: TensorDataType): string =
+  result = case kind
+    of tdtAuto:
+      "AUTO"
+    of tdtUint8:
+      "UINT8"
+    of tdtUint16:
+      "UINT16"
+    of tdtFloat32:
+      "FLOAT32"
+    else:
+      "UNKNOWN"
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc pixelFormatName*(fmt: PixelFormat): string =
+  result = case fmt
+    of pfAuto:
+      "AUTO"
+    of pfNhwc:
+      "NHWC"
+    of pfNhcw:
+      "NHCW"
+    of pfNchw:
+      "NCHW"
+    of pfNhw:
+      "NHW"
+    of pfNc:
+      "NC"
+    of pfRgb888:
+      "RGB888"
+    of pfRgb4:
+      "RGB4"
+    of pfNv12:
+      "NV12"
+    of pfNv21:
+      "NV21"
+    of pfYuy2:
+      "YUY2"
+    of pfI420:
+      "I420"
+    of pfFcr:
+      "FCR"
+    of pfF8cr:
+      "F8CR"
+    of pfBayerRgb:
+      "BAYER_RGB"
+    of pf12BitBayerRgb:
+      "12_BIT_BAYER_RGB"
+    of pfHailoNms:
+      "HAILO_NMS"
+    of pfHailoNmsWithByteMask:
+      "HAILO_NMS_WITH_BYTE_MASK"
+    of pfHailoNmsOnChip:
+      "HAILO_NMS_ON_CHIP"
+    of pfHailoNmsByClass:
+      "HAILO_NMS_BY_CLASS"
+    of pfHailoNmsByScore:
+      "HAILO_NMS_BY_SCORE"
+    of pfHailoYyuv:
+      "HAILO_YYUV"
+    of pfHailoYyvu:
+      "HAILO_YYVU"
+    of pfHailoYyyyuv:
+      "HAILO_YYYYUV"
+    else:
+      "UNKNOWN"
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc formatFlags*(fmt: Format): set[FormatFlag] =
+  let rawFlags = cint(fmt.flags)
+  var resultFlags: set[FormatFlag] = {}
+
+  if (rawFlags and cint(HAILO_FORMAT_FLAGS_QUANTIZED)) != 0:
+    resultFlags.incl ffQuantized
+
+  if (rawFlags and cint(HAILO_FORMAT_FLAGS_TRANSPOSED)) != 0:
+    resultFlags.incl ffTransposed
+
+  result = resultFlags
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc formatFlagsText*(flags: set[FormatFlag]): string =
+  if flags.len == 0:
+    return "NONE"
+  var parts: seq[string] = @[]
+  if ffQuantized in flags:
+    parts.add("QUANTIZED")
+  if ffTransposed in flags:
+    parts.add("TRANSPOSED")
+
+  result = parts.join("|")
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc imageShape*(info: VstreamInfo): ImageShape =
+  result = ImageShape(
+    height: int(info.anon0.shape.height),
+    width: int(info.anon0.shape.width),
+    channels: int(info.anon0.shape.features)
+  )
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc shapeText*(shape: ImageShape): string =
+  result = $shape.height & " x " & $shape.width & " x " & $shape.channels
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc metadata*(info: VstreamInfo): VStreamMetadata =
+  result = VStreamMetadata(
+    name: info.name(),
+    networkName: info.networkName(),
+    dataType: tensorDataType(info.format),
+    pixelFormat: pixelFormat(info.format),
+    flags: formatFlags(info.format),
+    shape: imageShape(info)
+  )
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc isNhwc*(info: VstreamInfo): bool =
+  result = pixelFormat(info.format) == pfNhwc
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc isNhwc3Input*(info: VstreamInfo): bool =
+  let meta = info.metadata
+  result = meta.dataType == tdtUint8 and meta.pixelFormat == pfNhwc and
+      meta.shape.channels == 3
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc isNhwc4Input*(info: VstreamInfo): bool =
+  let meta = info.metadata
+  result = meta.dataType == tdtUint8 and meta.pixelFormat == pfNhwc and
+      meta.shape.channels == 4
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc expectedByteSize*(info: VstreamInfo): HE[int] =
+  let shape = imageShape(info)
+  let h = shape.height
+  let w = shape.width
+  let c = shape.channels
+
+  if h <= 0 or w <= 0 or c <= 0:
+    return makeError(HAILO_INVALID_ARGUMENT,
+      "invalid vstream shape").err
+
+  result = case pixelFormat(info.format)
+    of pfNv12, pfNv21:
+      ok((w * h * 3) div 2)
+    of pfI420:
+      ok((w * h * 3) div 2)
+    of pfYuy2:
+      ok(w * h * 2)
+    else:
+      ok(w * h * c)
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc validateInputBuffer*(info: VstreamInfo, dataLen: int): HE[void] =
+  if dataLen <= 0:
+    return makeError(HAILO_INVALID_ARGUMENT, "input buffer is empty").err
+
+  let expectedRes = info.expectedByteSize()
+  if expectedRes.isErr:
+    return expectedRes.error.err
+
+  let expected = expectedRes.get
+  if dataLen != expected:
+    let shape = info.imageShape
+    let msg = "input buffer size mismatch: expected=" & $expected &
+        " actual=" & $dataLen & " shape=" & shapeText(shape)
+    return makeError(HAILO_INVALID_ARGUMENT, msg).err
+
+  result = okVoid()
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc validateNhwc4Input*(info: VstreamInfo, dataLen: int): HE[void] =
+  let meta = info.metadata
+  if meta.dataType != tdtUint8:
+    return makeError(HAILO_INVALID_ARGUMENT,
+        "input data type is not UINT8: " & dataTypeName(meta.dataType)).err
+  if meta.pixelFormat != pfNhwc:
+    return makeError(HAILO_INVALID_ARGUMENT,
+        "input pixel format is not NHWC: " & pixelFormatName(meta.pixelFormat)).err
+  if meta.shape.channels != 4:
+    return makeError(HAILO_INVALID_ARGUMENT,
+        "input channels is not 4: " & $meta.shape.channels).err
+
+  result = info.validateInputBuffer(dataLen)
 
 # ==============================================================================
 # Raw handles
@@ -203,6 +490,15 @@ proc info*(s: InputVStream): HE[VstreamInfo] =
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
+proc metadata*(s: InputVStream): HE[VStreamMetadata] =
+  let infoRes = s.info()
+  if infoRes.isErr:
+    return infoRes.error.err
+  result = infoRes.get.metadata.ok
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
 proc userBufferFormat*(s: InputVStream): HE[Format] =
   if s.isNil or s.raw.isNil:
     return makeError(HAILO_INVALID_ARGUMENT, "input vstream is nil").err
@@ -239,7 +535,7 @@ proc name*(s: InputVStream): HE[string] =
   let infoRes = s.info()
   if infoRes.isErr:
     return infoRes.error.err
-  result = infoRes.get.name.cCharArrayToString.ok
+  result = infoRes.get.name().ok
 
 # ------------------------------------------------------------------------------
 #
@@ -248,7 +544,7 @@ proc networkName*(s: InputVStream): HE[string] =
   let infoRes = s.info()
   if infoRes.isErr:
     return infoRes.error.err
-  result = infoRes.get.networkName.cCharArrayToString.ok
+  result = infoRes.get.networkName().ok
 
 # ------------------------------------------------------------------------------
 #
@@ -275,6 +571,25 @@ proc write*(s: InputVStream, buffer: PixBuffer): HE[void] =
   let b = buffer
   check(hailo_vstream_write_pix_buffer(s.raw, addr b))
 
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc writeNhwc4*(s: InputVStream, data: openArray[byte]): HE[void] =
+  if s.isNil or s.raw.isNil:
+    return makeError(HAILO_INVALID_ARGUMENT, "input vstream is nil").err
+  if data.len == 0:
+    return makeError(HAILO_INVALID_ARGUMENT, "input buffer is empty").err
+
+  let infoRes = s.info()
+  if infoRes.isErr:
+    return infoRes.error.err
+
+  let validateRes = infoRes.get.validateNhwc4Input(data.len)
+  if validateRes.isErr:
+    return validateRes.error.err
+
+  result = s.write(data)
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
@@ -310,6 +625,15 @@ proc info*(s: OutputVStream): HE[VstreamInfo] =
   if res != HAILO_SUCCESS:
     return makeError(res, $res).err
   result = info.ok
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc metadata*(s: OutputVStream): HE[VStreamMetadata] =
+  let infoRes = s.info()
+  if infoRes.isErr:
+    return infoRes.error.err
+  result = infoRes.get.metadata.ok
 
 # ------------------------------------------------------------------------------
 #
@@ -350,7 +674,7 @@ proc name*(s: OutputVStream): HE[string] =
   let infoRes = s.info()
   if infoRes.isErr:
     return infoRes.error.err
-  result = infoRes.get.name.cCharArrayToString.ok
+  result = infoRes.get.name().ok
 
 # ------------------------------------------------------------------------------
 #
@@ -359,7 +683,7 @@ proc networkName*(s: OutputVStream): HE[string] =
   let infoRes = s.info()
   if infoRes.isErr:
     return infoRes.error.err
-  result = infoRes.get.networkName.cCharArrayToString.ok
+  result = infoRes.get.networkName().ok
 
 # ------------------------------------------------------------------------------
 #
@@ -422,7 +746,6 @@ proc frameSize*(info: VstreamInfo, fmt: Format): HE[int] =
     return makeError(res, $res).err
   result = int(sz).ok
 
-
 # ==============================================================================
 # Test
 # ==============================================================================
@@ -431,6 +754,60 @@ when isMainModule:
   import std/os
   import ./hef
   import ./vdevice
+
+  proc printInputSummary(index: int, s: InputVStream) =
+    let metaRes = s.metadata()
+    let sizeRes = s.frameSize()
+    let userFmtRes = s.userBufferFormat()
+
+    if metaRes.isErr:
+      echo "  input[", index, "]: error: ", metaRes.error
+      return
+
+    let meta = metaRes.get
+    echo "  input[", index, "]:"
+    echo "    name        : ", meta.name
+    echo "    network     : ", meta.networkName
+    echo "    type        : ", dataTypeName(meta.dataType)
+    echo "    order       : ", pixelFormatName(meta.pixelFormat)
+    echo "    flags       : ", formatFlagsText(meta.flags)
+    echo "    shape       : ", shapeText(meta.shape)
+
+    if sizeRes.isOk:
+      echo "    frame_size  : ", sizeRes.get
+
+    if userFmtRes.isOk:
+      let userFmt = userFmtRes.get
+      echo "    user_format : order=", pixelFormatName(pixelFormat(userFmt)),
+          " type=", dataTypeName(tensorDataType(userFmt)),
+          " flags=", formatFlagsText(formatFlags(userFmt))
+
+  proc printOutputSummary(index: int, s: OutputVStream) =
+    let metaRes = s.metadata()
+    let sizeRes = s.frameSize()
+    let userFmtRes = s.userBufferFormat()
+
+    if metaRes.isErr:
+      echo "  output[", index, "]: error: ", metaRes.error
+      return
+
+    let meta = metaRes.get
+    echo "  output[", index, "]:"
+    echo "    name        : ", meta.name
+    echo "    network     : ", meta.networkName
+    echo "    type        : ", dataTypeName(meta.dataType)
+    echo "    order       : ", pixelFormatName(meta.pixelFormat)
+    echo "    flags       : ", formatFlagsText(meta.flags)
+    echo "    shape       : ", shapeText(meta.shape)
+
+    if sizeRes.isOk:
+      echo "    frame_size  : ", sizeRes.get
+
+    if userFmtRes.isOk:
+      let userFmt = userFmtRes.get
+      echo "    user_format : order=", pixelFormatName(pixelFormat(userFmt)),
+          " type=", dataTypeName(tensorDataType(userFmt)),
+          " flags=", formatFlagsText(formatFlags(userFmt))
 
   if paramCount() < 1:
     echo "Usage: vstream <model.hef>"
@@ -504,18 +881,10 @@ when isMainModule:
   echo "Output vstreams: ", outStreams.len
 
   for i in 0..<inStreams.len:
-    let s = inStreams[i]
-    let nameRes = s.name()
-    let sizeRes = s.frameSize()
-    if nameRes.isOk and sizeRes.isOk:
-      echo "  input[", i, "]: ", nameRes.get, " frame_size=", sizeRes.get
+    printInputSummary(i, inStreams[i])
 
   for i in 0..<outStreams.len:
-    let s = outStreams[i]
-    let nameRes = s.name()
-    let sizeRes = s.frameSize()
-    if nameRes.isOk and sizeRes.isOk:
-      echo "  output[", i, "]: ", nameRes.get, " frame_size=", sizeRes.get
+    printOutputSummary(i, outStreams[i])
 
   discard outStreams.close()
   discard inStreams.close()
