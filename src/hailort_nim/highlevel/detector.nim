@@ -1,14 +1,8 @@
 import std/[algorithm, sequtils, strformat]
 import ../lowlevel
+import ../models/detection
 
 type
-  Detection* = object
-    classId*: int
-    score*: float32
-    yMin*: float32
-    xMin*: float32
-    yMax*: float32
-    xMax*: float32
   Detector* = ref object
     hef*: Hef
     vdevice*: Vdevice
@@ -131,6 +125,25 @@ proc outputPixelFormat*(d: Detector): HE[PixelFormat] =
   if mdRes.isErr:
     return mdRes.error.err
   result = mdRes.get.pixelFormat.ok
+
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc inputImageType*(d: Detector): HE[ImageType] =
+  let mdRes = d.inputMetadata()
+  if mdRes.isErr:
+    return mdRes.error.err
+  result = mdRes.get.imageType.ok
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc outputImageType*(d: Detector): HE[ImageType] =
+  let mdRes = d.outputMetadata()
+  if mdRes.isErr:
+    return mdRes.error.err
+  result = mdRes.get.imageType.ok
 
 # ------------------------------------------------------------------------------
 #
@@ -364,6 +377,24 @@ proc inferNhwc4*(d: Detector; input: openArray[byte]): HE[seq[byte]] =
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
+proc infer*(d: Detector; input: openArray[byte]): HE[seq[byte]] =
+  if d.isNil:
+    return makeError(HAILO_INVALID_ARGUMENT, "detector is nil").err
+
+  let mdRes = d.inputMetadata()
+  if mdRes.isErr:
+    return mdRes.error.err
+  let md = mdRes.get
+
+  case md.imageType
+  of itNhwc4:
+    result = d.inferNhwc4(input)
+  else:
+    result = d.inferRaw(input)
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
 proc detectNmsByClass*(d: Detector, input: openArray[byte],
     appScoreThreshold = 0.25'f32): HE[seq[Detection]] =
   if d.isNil:
@@ -418,3 +449,24 @@ proc detectNmsByClassNhwc4*(d: Detector, input: openArray[byte],
 
   detections.sortByScoreDesc()
   result = detections.ok
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc detectNmsByClassAuto*(d: Detector, input: openArray[byte],
+    appScoreThreshold = 0.25'f32): HE[seq[Detection]] =
+  if d.isNil:
+    return makeError(HAILO_INVALID_ARGUMENT, "detector is nil").err
+
+  let mdRes = d.inputMetadata()
+  if mdRes.isErr:
+    return mdRes.error.err
+  let md = mdRes.get
+
+  case md.imageType
+  of itNhwc4:
+    result = d.detectNmsByClassNhwc4(input, appScoreThreshold)
+  of itNhwc3, itUnknown:
+    result = d.detectNmsByClass(input, appScoreThreshold)
+  else:
+    result = d.detectNmsByClass(input, appScoreThreshold)

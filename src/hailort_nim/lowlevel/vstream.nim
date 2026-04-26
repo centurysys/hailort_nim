@@ -215,7 +215,7 @@ proc formatFlags*(fmt: Format): set[FormatFlag] =
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
-proc formatFlagsText*(flags: set[FormatFlag]): string =
+proc `$`*(flags: set[FormatFlag]): string =
   if flags.len == 0:
     return "NONE"
   var parts: seq[string] = @[]
@@ -239,8 +239,35 @@ proc imageShape*(info: VstreamInfo): ImageShape =
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
-proc shapeText*(shape: ImageShape): string =
+proc `$`*(shape: ImageShape): string =
   result = $shape.height & " x " & $shape.width & " x " & $shape.channels
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc imageType*(info: VstreamInfo): ImageType =
+  let pf = pixelFormat(info.format)
+  let shape = imageShape(info)
+
+  result = case pf
+    of pfNhwc:
+      case shape.channels
+      of 3:
+        itNhwc3
+      of 4:
+        itNhwc4
+      else:
+        itUnknown
+    of pfNv12:
+      itNv12
+    of pfNv21:
+      itNv21
+    of pfYuy2:
+      itYuy2
+    of pfI420:
+      itI420
+    else:
+      itUnknown
 
 # ------------------------------------------------------------------------------
 #
@@ -251,6 +278,7 @@ proc metadata*(info: VstreamInfo): VStreamMetadata =
     networkName: info.networkName(),
     dataType: tensorDataType(info.format),
     pixelFormat: pixelFormat(info.format),
+    imageType: imageType(info),
     flags: formatFlags(info.format),
     shape: imageShape(info)
   )
@@ -315,7 +343,7 @@ proc validateInputBuffer*(info: VstreamInfo, dataLen: int): HE[void] =
   if dataLen != expected:
     let shape = info.imageShape
     let msg = "input buffer size mismatch: expected=" & $expected &
-        " actual=" & $dataLen & " shape=" & shapeText(shape)
+        " actual=" & $dataLen & " shape=" & $shape
     return makeError(HAILO_INVALID_ARGUMENT, msg).err
 
   result = okVoid()
@@ -770,8 +798,9 @@ when isMainModule:
     echo "    network     : ", meta.networkName
     echo "    type        : ", dataTypeName(meta.dataType)
     echo "    order       : ", pixelFormatName(meta.pixelFormat)
-    echo "    flags       : ", formatFlagsText(meta.flags)
-    echo "    shape       : ", shapeText(meta.shape)
+    echo "    image_type  : ", $meta.imageType
+    echo "    flags       : ", $meta.flags
+    echo "    shape       : ", $meta.shape
 
     if sizeRes.isOk:
       echo "    frame_size  : ", sizeRes.get
@@ -780,7 +809,7 @@ when isMainModule:
       let userFmt = userFmtRes.get
       echo "    user_format : order=", pixelFormatName(pixelFormat(userFmt)),
           " type=", dataTypeName(tensorDataType(userFmt)),
-          " flags=", formatFlagsText(formatFlags(userFmt))
+          " flags=", $formatFlags(userFmt)
 
   proc printOutputSummary(index: int, s: OutputVStream) =
     let metaRes = s.metadata()
@@ -797,8 +826,8 @@ when isMainModule:
     echo "    network     : ", meta.networkName
     echo "    type        : ", dataTypeName(meta.dataType)
     echo "    order       : ", pixelFormatName(meta.pixelFormat)
-    echo "    flags       : ", formatFlagsText(meta.flags)
-    echo "    shape       : ", shapeText(meta.shape)
+    echo "    flags       : ", $meta.flags
+    echo "    shape       : ", $meta.shape
 
     if sizeRes.isOk:
       echo "    frame_size  : ", sizeRes.get
@@ -807,7 +836,7 @@ when isMainModule:
       let userFmt = userFmtRes.get
       echo "    user_format : order=", pixelFormatName(pixelFormat(userFmt)),
           " type=", dataTypeName(tensorDataType(userFmt)),
-          " flags=", formatFlagsText(formatFlags(userFmt))
+          " flags=", $formatFlags(userFmt)
 
   if paramCount() < 1:
     echo "Usage: vstream <model.hef>"
