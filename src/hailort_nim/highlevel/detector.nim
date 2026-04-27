@@ -5,14 +5,24 @@ import ../models/detection
 
 type
   Detector* = ref object
+    ## High-level object-detection helper.
+    ##
+    ## Prepared detectors own HEF/network/vstreams. Activation is separated so
+    ## multiple prepared detectors can share one HailoRuntime and be activated
+    ## one at a time.
+    runtime*: HailoRuntime
+    ownsRuntime*: bool
+
     hef*: Hef
     vdevice*: Vdevice
     networkGroup*: NetworkGroup
     activated*: ActivatedNetworkGroup
+
     inputVstreams*: InputVStreams
     outputVstreams*: OutputVStreams
     inputVstream*: InputVStream
     outputVstream*: OutputVStream
+
     inputInfo*: VstreamInfo
     outputInfo*: VstreamInfo
     inputFrameSize*: int
@@ -29,9 +39,13 @@ proc readF32Le(data: openArray[byte]; offset: int): float32 =
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
-proc parseNmsByClassVariableInto*(raw: openArray[byte], numberOfClasses: int,
-    maxBboxesPerClass: int, detections: var seq[Detection],
-    appScoreThreshold = 0.25'f32) =
+proc parseNmsByClassVariableInto*(
+  raw: openArray[byte],
+  numberOfClasses: int,
+  maxBboxesPerClass: int,
+  detections: var seq[Detection],
+  appScoreThreshold = 0.25'f32
+) =
   ## Parse HAILO_FORMAT_ORDER_HAILO_NMS_BY_CLASS variable-length layout into
   ## a caller-provided detection sequence.
   ##
@@ -42,7 +56,7 @@ proc parseNmsByClassVariableInto*(raw: openArray[byte], numberOfClasses: int,
   var offset = 0
   let rawLen = raw.len
 
-  for classId in 0..<numberOfClasses:
+  for classId in 0 ..< numberOfClasses:
     if offset + 4 > rawLen:
       return
 
@@ -55,7 +69,7 @@ proc parseNmsByClassVariableInto*(raw: openArray[byte], numberOfClasses: int,
     if count > maxBboxesPerClass:
       count = maxBboxesPerClass
 
-    for _ in 0..<count:
+    for _ in 0 ..< count:
       if offset + 20 > rawLen:
         return
 
@@ -67,19 +81,25 @@ proc parseNmsByClassVariableInto*(raw: openArray[byte], numberOfClasses: int,
       offset += 20
 
       if appScoreThreshold <= 0 or score >= appScoreThreshold:
-        let detection = Detection(classId: classId, score: score,
-            yMin: yMin, xMin: xMin, yMax: yMax, xMax: xMax)
-        detections.add(detection)
+        detections.add(Detection(
+          classId: classId,
+          score: score,
+          yMin: yMin,
+          xMin: xMin,
+          yMax: yMax,
+          xMax: xMax
+        ))
 
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
-proc parseNmsByClassVariable*(raw: openArray[byte], numberOfClasses: int,
-    maxBboxesPerClass: int, appScoreThreshold = 0.25'f32): seq[Detection] =
-  ## Parse HAILO_FORMAT_ORDER_HAILO_NMS_BY_CLASS variable-length layout.
-  ##
-  ## This allocation-returning wrapper is kept for compatibility. Streaming code
-  ## should prefer parseNmsByClassVariableInto().
+proc parseNmsByClassVariable*(
+  raw: openArray[byte],
+  numberOfClasses: int,
+  maxBboxesPerClass: int,
+  appScoreThreshold = 0.25'f32
+): seq[Detection] =
+  ## Allocation-returning compatibility wrapper.
   parseNmsByClassVariableInto(
     raw,
     numberOfClasses,
@@ -98,13 +118,19 @@ proc sortByScoreDesc*(detections: var seq[Detection]) =
 #
 # ------------------------------------------------------------------------------
 proc inputSize*(d: Detector): int {.inline.} =
-  d.inputFrameSize
+  result = d.inputFrameSize
 
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
 proc outputSize*(d: Detector): int {.inline.} =
-  d.outputFrameSize
+  result = d.outputFrameSize
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc isActivated*(d: Detector): bool {.inline.} =
+  result = (not d.isNil) and (not d.activated.isNil)
 
 # ------------------------------------------------------------------------------
 #
@@ -177,16 +203,55 @@ proc outputImageType*(d: Detector): HE[ImageType] =
   result = mdRes.get.imageType.ok
 
 # ------------------------------------------------------------------------------
+# Activation lifecycle:
+# ------------------------------------------------------------------------------
+proc activate*(d: Detector): HE[void] =
+  ## Activate this detector's network group.
+  ##
+  ## A Hailo device can have only one active network group at a time in this
+  ## usage pattern. Call deactivate() before activating another prepared
+  ## detector on the same runtime.
+  if d.isNil:
+    return makeError(HAILO_INVALID_ARGUMENT, "detector is nil").err
+  if d.networkGroup.isNil:
+    return makeError(HAILO_INVALID_OPERATION, "network group is nil").err
+  if not d.activated.isNil:
+    return okVoid()
+
+  let activatedRes = d.networkGroup.activate()
+  if activatedRes.isErr:
+    return activatedRes.error.err
+
+  d.activated = activatedRes.get
+  result = okVoid()
+
+# ------------------------------------------------------------------------------
 #
+# ------------------------------------------------------------------------------
+proc deactivate*(d: Detector): HE[void] =
+  ## Deactivate this detector's network group, keeping HEF/network/vstreams alive.
+  if d.isNil:
+    return okVoid()
+  if d.activated.isNil:
+    return okVoid()
+
+  let res = d.activated.close()
+  if res.isErr:
+    return res
+
+  d.activated = nil
+  result = okVoid()
+
+# ------------------------------------------------------------------------------
+# Close:
 # ------------------------------------------------------------------------------
 proc close*(d: Detector): HE[void] =
   if d.isNil:
     return okVoid()
 
-  if not d.activated.isNil:
-    let res = d.activated.close()
-    if res.isErr:
-      return res
+  let deactRes = d.deactivate()
+  if deactRes.isErr:
+    return deactRes
 
   if not d.inputVstreams.isNil:
     let res = d.inputVstreams.close()
@@ -203,13 +268,18 @@ proc close*(d: Detector): HE[void] =
     if res.isErr:
       return res
 
-  if not d.vdevice.isNil:
-    let res = d.vdevice.close()
+  if not d.hef.isNil:
+    let res = d.hef.close()
     if res.isErr:
       return res
 
-  if not d.hef.isNil:
-    let res = d.hef.close()
+  if d.ownsRuntime and not d.runtime.isNil:
+    let res = d.runtime.close()
+    if res.isErr:
+      return res
+  elif d.runtime.isNil and not d.vdevice.isNil:
+    ## Compatibility fallback for older construction paths.
+    let res = d.vdevice.close()
     if res.isErr:
       return res
 
@@ -221,61 +291,68 @@ proc close*(d: Detector): HE[void] =
   d.networkGroup = nil
   d.vdevice = nil
   d.hef = nil
+  d.runtime = nil
+  d.ownsRuntime = false
 
-  okVoid()
+  result = okVoid()
 
 # ------------------------------------------------------------------------------
-#
+# Prepared open helpers:
 # ------------------------------------------------------------------------------
-proc open*(_: typedesc[Detector], hefPath: string,
-    hailoNmsScoreThreshold = -1.0'f32,
-    schedulingAlgorithm: SchedulingAlgorithm =
-        HAILO_SCHEDULING_ALGORITHM_NONE): HE[Detector] =
+proc openPreparedWithRuntime(
+  runtime: HailoRuntime,
+  hefPath: string,
+  hailoNmsScoreThreshold: float32,
+  ownsRuntime: bool
+): HE[Detector] =
+  if runtime.isNil or not runtime.isOpen():
+    return makeError(HAILO_INVALID_ARGUMENT, "runtime is not open").err
+
   let hefRes = openHef(hefPath)
   if hefRes.isErr:
+    if ownsRuntime:
+      discard runtime.close()
     return hefRes.error.err
   let hefObj = hefRes.get
 
-  var vdevParamsRes = initVdeviceParams()
-  if vdevParamsRes.isErr:
+  let vdevObj = runtime.rawVdevice()
+  if vdevObj.isNil or vdevObj.rawHandle.isNil:
     discard hefObj.close()
-    return vdevParamsRes.error.err
-  var vdevParams = vdevParamsRes.get
-  vdevParams.scheduling_algorithm = schedulingAlgorithm
-
-  let vdevRes = createVdevice(vdevParams)
-  if vdevRes.isErr:
-    discard hefObj.close()
-    return vdevRes.error.err
-  let vdevObj = vdevRes.get
+    if ownsRuntime:
+      discard runtime.close()
+    return makeError(HAILO_INVALID_ARGUMENT, "runtime vdevice is nil").err
 
   let ngRes = configureOne(vdevObj, hefObj)
   if ngRes.isErr:
-    discard vdevObj.close()
     discard hefObj.close()
+    if ownsRuntime:
+      discard runtime.close()
     return ngRes.error.err
   let ngObj = ngRes.get
 
   let inputParamsRes = makeInputVstreamParams(ngObj)
   if inputParamsRes.isErr:
     discard ngObj.close()
-    discard vdevObj.close()
     discard hefObj.close()
+    if ownsRuntime:
+      discard runtime.close()
     return inputParamsRes.error.err
   let inputParams = inputParamsRes.get
 
   let outputParamsRes = makeOutputVstreamParams(ngObj)
   if outputParamsRes.isErr:
     discard ngObj.close()
-    discard vdevObj.close()
     discard hefObj.close()
+    if ownsRuntime:
+      discard runtime.close()
     return outputParamsRes.error.err
   let outputParams = outputParamsRes.get
 
   if inputParams.len != 1:
     discard ngObj.close()
-    discard vdevObj.close()
     discard hefObj.close()
+    if ownsRuntime:
+      discard runtime.close()
     return makeError(
       HAILO_INVALID_OPERATION,
       &"Detector currently expects exactly 1 input vstream, got {inputParams.len}"
@@ -283,8 +360,9 @@ proc open*(_: typedesc[Detector], hefPath: string,
 
   if outputParams.len != 1:
     discard ngObj.close()
-    discard vdevObj.close()
     discard hefObj.close()
+    if ownsRuntime:
+      discard runtime.close()
     return makeError(
       HAILO_INVALID_OPERATION,
       &"Detector currently expects exactly 1 output vstream, got {outputParams.len}"
@@ -293,8 +371,9 @@ proc open*(_: typedesc[Detector], hefPath: string,
   let inputVstreamsRes = createInputVstreams(ngObj, inputParams)
   if inputVstreamsRes.isErr:
     discard ngObj.close()
-    discard vdevObj.close()
     discard hefObj.close()
+    if ownsRuntime:
+      discard runtime.close()
     return inputVstreamsRes.error.err
   let inputVstreams = inputVstreamsRes.get
 
@@ -302,8 +381,9 @@ proc open*(_: typedesc[Detector], hefPath: string,
   if outputVstreamsRes.isErr:
     discard inputVstreams.close()
     discard ngObj.close()
-    discard vdevObj.close()
     discard hefObj.close()
+    if ownsRuntime:
+      discard runtime.close()
     return outputVstreamsRes.error.err
   let outputVstreams = outputVstreamsRes.get
 
@@ -315,8 +395,9 @@ proc open*(_: typedesc[Detector], hefPath: string,
     discard outputVstreams.close()
     discard inputVstreams.close()
     discard ngObj.close()
-    discard vdevObj.close()
     discard hefObj.close()
+    if ownsRuntime:
+      discard runtime.close()
     return inputInfoRes.error.err
   let inputInfo = inputInfoRes.get
 
@@ -325,8 +406,9 @@ proc open*(_: typedesc[Detector], hefPath: string,
     discard outputVstreams.close()
     discard inputVstreams.close()
     discard ngObj.close()
-    discard vdevObj.close()
     discard hefObj.close()
+    if ownsRuntime:
+      discard runtime.close()
     return outputInfoRes.error.err
   let outputInfo = outputInfoRes.get
 
@@ -335,8 +417,9 @@ proc open*(_: typedesc[Detector], hefPath: string,
     discard outputVstreams.close()
     discard inputVstreams.close()
     discard ngObj.close()
-    discard vdevObj.close()
     discard hefObj.close()
+    if ownsRuntime:
+      discard runtime.close()
     return inputFrameSizeRes.error.err
   let inputFrameSize = inputFrameSizeRes.get
 
@@ -345,8 +428,9 @@ proc open*(_: typedesc[Detector], hefPath: string,
     discard outputVstreams.close()
     discard inputVstreams.close()
     discard ngObj.close()
-    discard vdevObj.close()
     discard hefObj.close()
+    if ownsRuntime:
+      discard runtime.close()
     return outputFrameSizeRes.error.err
   let outputFrameSize = outputFrameSizeRes.get
 
@@ -356,24 +440,18 @@ proc open*(_: typedesc[Detector], hefPath: string,
       discard outputVstreams.close()
       discard inputVstreams.close()
       discard ngObj.close()
-      discard vdevObj.close()
       discard hefObj.close()
+      if ownsRuntime:
+        discard runtime.close()
       return setThRes.error.err
 
-  let activatedRes = ngObj.activate()
-  if activatedRes.isErr:
-    discard outputVstreams.close()
-    discard inputVstreams.close()
-    discard ngObj.close()
-    discard vdevObj.close()
-    discard hefObj.close()
-    return activatedRes.error.err
-
   result = Detector(
+    runtime: runtime,
+    ownsRuntime: ownsRuntime,
     hef: hefObj,
     vdevice: vdevObj,
     networkGroup: ngObj,
-    activated: activatedRes.get,
+    activated: nil,
     inputVstreams: inputVstreams,
     outputVstreams: outputVstreams,
     inputVstream: inputVstream,
@@ -387,25 +465,139 @@ proc open*(_: typedesc[Detector], hefPath: string,
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
+proc openPrepared*(
+  _: typedesc[Detector],
+  runtime: HailoRuntime,
+  hefPath: string,
+  hailoNmsScoreThreshold = -1.0'f32
+): HE[Detector] =
+  ## Configure HEF/vstreams on a shared runtime without activating the network.
+  ##
+  ## Use this for multi-model tests:
+  ##   let d = Detector.openPrepared(runtime, "model.hef").get
+  ##   d.activate()
+  ##   ...
+  ##   d.deactivate()
+  result = openPreparedWithRuntime(
+    runtime,
+    hefPath,
+    hailoNmsScoreThreshold,
+    ownsRuntime = false
+  )
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc openPrepared*(
+  _: typedesc[Detector],
+  hefPath: string,
+  hailoNmsScoreThreshold = -1.0'f32,
+  schedulingAlgorithm: SchedulingAlgorithm = HAILO_SCHEDULING_ALGORITHM_NONE
+): HE[Detector] =
+  ## Compatibility helper for a single prepared detector with an internally owned
+  ## runtime. The returned detector is not activated yet.
+  var runtimeRes = HailoRuntime.open(schedulingAlgorithm)
+  if runtimeRes.isErr:
+    return runtimeRes.error.err
+
+  result = openPreparedWithRuntime(
+    runtimeRes.get,
+    hefPath,
+    hailoNmsScoreThreshold,
+    ownsRuntime = true
+  )
+
+# ------------------------------------------------------------------------------
+# Compatibility open APIs:
+# ------------------------------------------------------------------------------
+proc open*(
+  _: typedesc[Detector],
+  runtime: HailoRuntime,
+  hefPath: string,
+  hailoNmsScoreThreshold = -1.0'f32
+): HE[Detector] =
+  ## Backward-compatible shared-runtime open.
+  ##
+  ## This still activates immediately. Multi-model code should use
+  ## Detector.openPrepared(runtime, hefPath) and explicit activate/deactivate.
+  let preparedRes = Detector.openPrepared(runtime, hefPath, hailoNmsScoreThreshold)
+  if preparedRes.isErr:
+    return preparedRes.error.err
+
+  let detector = preparedRes.get
+  let actRes = detector.activate()
+  if actRes.isErr:
+    discard detector.close()
+    return actRes.error.err
+
+  result = detector.ok
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc open*(
+  _: typedesc[Detector],
+  hefPath: string,
+  hailoNmsScoreThreshold = -1.0'f32,
+  schedulingAlgorithm: SchedulingAlgorithm = HAILO_SCHEDULING_ALGORITHM_NONE
+): HE[Detector] =
+  ## Existing API: open and activate immediately.
+  let preparedRes = Detector.openPrepared(
+    hefPath,
+    hailoNmsScoreThreshold,
+    schedulingAlgorithm
+  )
+  if preparedRes.isErr:
+    return preparedRes.error.err
+
+  let detector = preparedRes.get
+  let actRes = detector.activate()
+  if actRes.isErr:
+    discard detector.close()
+    return actRes.error.err
+
+  result = detector.ok
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
 proc validateOutputBuffer(d: Detector; outputLen: int): HE[void] =
   if outputLen == 0:
     return makeError(HAILO_INVALID_ARGUMENT, "output buffer is empty").err
-
   if outputLen != d.outputFrameSize:
     return makeError(
       HAILO_INVALID_ARGUMENT,
       &"output buffer size mismatch: expected={d.outputFrameSize} actual={outputLen}"
     ).err
-
   result = okVoid()
 
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
-proc inferRawInto*(d: Detector; input: openArray[byte];
-    output: var openArray[byte]): HE[void] =
+proc validateActivated(d: Detector): HE[void] =
   if d.isNil:
     return makeError(HAILO_INVALID_ARGUMENT, "detector is nil").err
+  if d.activated.isNil:
+    return makeError(
+      HAILO_INVALID_OPERATION,
+      "detector is not activated; call activate() before inference"
+    ).err
+  result = okVoid()
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc inferRawInto*(
+  d: Detector;
+  input: openArray[byte];
+  output: var openArray[byte]
+): HE[void] =
+  if d.isNil:
+    return makeError(HAILO_INVALID_ARGUMENT, "detector is nil").err
+
+  let activatedRes = d.validateActivated()
+  if activatedRes.isErr:
+    return activatedRes.error.err
 
   let validateInputRes = validateInputBuffer(d.inputInfo, input.len)
   if validateInputRes.isErr:
@@ -427,7 +619,6 @@ proc inferRawInto*(d: Detector; input: openArray[byte];
 proc inferRaw*(d: Detector; input: openArray[byte]): HE[seq[byte]] =
   if d.isNil:
     return makeError(HAILO_INVALID_ARGUMENT, "detector is nil").err
-
   if d.outputFrameSize == 0:
     return makeError(HAILO_INVALID_ARGUMENT, "output size is zero").err
 
@@ -441,10 +632,17 @@ proc inferRaw*(d: Detector; input: openArray[byte]): HE[seq[byte]] =
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
-proc inferNhwc4Into*(d: Detector; input: openArray[byte];
-    output: var openArray[byte]): HE[void] =
+proc inferNhwc4Into*(
+  d: Detector;
+  input: openArray[byte];
+  output: var openArray[byte]
+): HE[void] =
   if d.isNil:
     return makeError(HAILO_INVALID_ARGUMENT, "detector is nil").err
+
+  let activatedRes = d.validateActivated()
+  if activatedRes.isErr:
+    return activatedRes.error.err
 
   let validateOutputRes = d.validateOutputBuffer(output.len)
   if validateOutputRes.isErr:
@@ -456,13 +654,9 @@ proc inferNhwc4Into*(d: Detector; input: openArray[byte];
 
   result = d.outputVstream.read(addr output[0], output.len)
 
-# ------------------------------------------------------------------------------
-#
-# ------------------------------------------------------------------------------
 proc inferNhwc4*(d: Detector; input: openArray[byte]): HE[seq[byte]] =
   if d.isNil:
     return makeError(HAILO_INVALID_ARGUMENT, "detector is nil").err
-
   if d.outputFrameSize == 0:
     return makeError(HAILO_INVALID_ARGUMENT, "output size is zero").err
 
@@ -476,8 +670,11 @@ proc inferNhwc4*(d: Detector; input: openArray[byte]): HE[seq[byte]] =
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
-proc inferInto*(d: Detector; input: openArray[byte];
-    output: var openArray[byte]): HE[void] =
+proc inferInto*(
+  d: Detector;
+  input: openArray[byte];
+  output: var openArray[byte]
+): HE[void] =
   if d.isNil:
     return makeError(HAILO_INVALID_ARGUMENT, "detector is nil").err
 
@@ -492,13 +689,9 @@ proc inferInto*(d: Detector; input: openArray[byte];
   else:
     result = d.inferRawInto(input, output)
 
-# ------------------------------------------------------------------------------
-#
-# ------------------------------------------------------------------------------
 proc infer*(d: Detector; input: openArray[byte]): HE[seq[byte]] =
   if d.isNil:
     return makeError(HAILO_INVALID_ARGUMENT, "detector is nil").err
-
   if d.outputFrameSize == 0:
     return makeError(HAILO_INVALID_ARGUMENT, "output size is zero").err
 
@@ -527,8 +720,12 @@ proc validateNmsByClassOutput(d: Detector): HE[void] =
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
-proc parseNmsOutputInto(d: Detector; output: openArray[byte];
-    detections: var seq[Detection]; appScoreThreshold: float32): HE[void] =
+proc parseNmsOutputInto(
+  d: Detector;
+  output: openArray[byte];
+  detections: var seq[Detection];
+  appScoreThreshold: float32
+): HE[void] =
   let validateRes = d.validateNmsByClassOutput()
   if validateRes.isErr:
     return validateRes.error.err
@@ -544,15 +741,20 @@ proc parseNmsOutputInto(d: Detector; output: openArray[byte];
     detections,
     appScoreThreshold
   )
+
   detections.sortByScoreDesc()
   result = okVoid()
 
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
-proc detectNmsByClassInto*(d: Detector; input: openArray[byte];
-    outputBuf: var openArray[byte]; detections: var seq[Detection];
-    appScoreThreshold = 0.25'f32): HE[void] =
+proc detectNmsByClassInto*(
+  d: Detector;
+  input: openArray[byte];
+  outputBuf: var openArray[byte];
+  detections: var seq[Detection];
+  appScoreThreshold = 0.25'f32
+): HE[void] =
   if d.isNil:
     return makeError(HAILO_INVALID_ARGUMENT, "detector is nil").err
 
@@ -569,9 +771,13 @@ proc detectNmsByClassInto*(d: Detector; input: openArray[byte];
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
-proc detectNmsByClassNhwc4Into*(d: Detector; input: openArray[byte];
-    outputBuf: var openArray[byte]; detections: var seq[Detection];
-    appScoreThreshold = 0.25'f32): HE[void] =
+proc detectNmsByClassNhwc4Into*(
+  d: Detector;
+  input: openArray[byte];
+  outputBuf: var openArray[byte];
+  detections: var seq[Detection];
+  appScoreThreshold = 0.25'f32
+): HE[void] =
   if d.isNil:
     return makeError(HAILO_INVALID_ARGUMENT, "detector is nil").err
 
@@ -588,9 +794,13 @@ proc detectNmsByClassNhwc4Into*(d: Detector; input: openArray[byte];
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
-proc detectNmsByClassAutoInto*(d: Detector; input: openArray[byte];
-    outputBuf: var openArray[byte]; detections: var seq[Detection];
-    appScoreThreshold = 0.25'f32): HE[void] =
+proc detectNmsByClassAutoInto*(
+  d: Detector;
+  input: openArray[byte];
+  outputBuf: var openArray[byte];
+  detections: var seq[Detection];
+  appScoreThreshold = 0.25'f32
+): HE[void] =
   if d.isNil:
     return makeError(HAILO_INVALID_ARGUMENT, "detector is nil").err
 
@@ -607,13 +817,6 @@ proc detectNmsByClassAutoInto*(d: Detector; input: openArray[byte];
       detections,
       appScoreThreshold
     )
-  of itNhwc3, itUnknown:
-    result = d.detectNmsByClassInto(
-      input,
-      outputBuf,
-      detections,
-      appScoreThreshold
-    )
   else:
     result = d.detectNmsByClassInto(
       input,
@@ -625,16 +828,19 @@ proc detectNmsByClassAutoInto*(d: Detector; input: openArray[byte];
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
-proc detectNmsByClass*(d: Detector, input: openArray[byte],
-    appScoreThreshold = 0.25'f32): HE[seq[Detection]] =
+proc detectNmsByClass*(
+  d: Detector,
+  input: openArray[byte],
+  appScoreThreshold = 0.25'f32
+): HE[seq[Detection]] =
   if d.isNil:
     return makeError(HAILO_INVALID_ARGUMENT, "detector is nil").err
-
   if d.outputFrameSize == 0:
     return makeError(HAILO_INVALID_ARGUMENT, "output size is zero").err
 
   var outputBuf = newSeq[byte](d.outputFrameSize)
   var detections: seq[Detection] = @[]
+
   let detectRes = d.detectNmsByClassInto(
     input,
     outputBuf,
@@ -649,16 +855,19 @@ proc detectNmsByClass*(d: Detector, input: openArray[byte],
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
-proc detectNmsByClassNhwc4*(d: Detector, input: openArray[byte],
-    appScoreThreshold = 0.25'f32): HE[seq[Detection]] =
+proc detectNmsByClassNhwc4*(
+  d: Detector,
+  input: openArray[byte],
+  appScoreThreshold = 0.25'f32
+): HE[seq[Detection]] =
   if d.isNil:
     return makeError(HAILO_INVALID_ARGUMENT, "detector is nil").err
-
   if d.outputFrameSize == 0:
     return makeError(HAILO_INVALID_ARGUMENT, "output size is zero").err
 
   var outputBuf = newSeq[byte](d.outputFrameSize)
   var detections: seq[Detection] = @[]
+
   let detectRes = d.detectNmsByClassNhwc4Into(
     input,
     outputBuf,
@@ -673,16 +882,19 @@ proc detectNmsByClassNhwc4*(d: Detector, input: openArray[byte],
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
-proc detectNmsByClassAuto*(d: Detector, input: openArray[byte],
-    appScoreThreshold = 0.25'f32): HE[seq[Detection]] =
+proc detectNmsByClassAuto*(
+  d: Detector,
+  input: openArray[byte],
+  appScoreThreshold = 0.25'f32
+): HE[seq[Detection]] =
   if d.isNil:
     return makeError(HAILO_INVALID_ARGUMENT, "detector is nil").err
-
   if d.outputFrameSize == 0:
     return makeError(HAILO_INVALID_ARGUMENT, "output size is zero").err
 
   var outputBuf = newSeq[byte](d.outputFrameSize)
   var detections: seq[Detection] = @[]
+
   let detectRes = d.detectNmsByClassAutoInto(
     input,
     outputBuf,

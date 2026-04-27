@@ -23,7 +23,7 @@ proc printInputMetadata(det: Detector) =
   echo &"  order       : {md.pixelFormat}"
   echo &"  image_type  : {md.imageType}"
   echo &"  flags       : {md.flags}"
-  echo &"  shape       : {shapeText(md.shape)}"
+  echo &"  shape       : {md.shape}"
   echo &"  frame_size  : {det.inputSize()}"
 
 # ------------------------------------------------------------------------------
@@ -38,7 +38,7 @@ proc printOutputMetadata(det: Detector) =
   echo &"  order       : {md.pixelFormat}"
   echo &"  image_type  : {md.imageType}"
   echo &"  flags       : {md.flags}"
-  echo &"  shape       : {shapeText(md.shape)}"
+  echo &"  shape       : {md.shape}"
   echo &"  frame_size  : {det.outputSize()}"
 
 # ------------------------------------------------------------------------------

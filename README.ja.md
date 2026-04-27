@@ -1,93 +1,149 @@
 # hailort_nim
 
-HailoRT のための Nim バインディングおよび高レベルAPI
-
-🇺🇸 English version → README.md
-
----
-
 ## 概要
 
-- Pythonは重い
-- C++はCMakeがつらい
-- コードが長い
+`hailort_nim` は HailoRT の Nim バインディングです。
 
-これを解消するためのライブラリです。
+- ゼロコピー志向
+- 低遅延推論
+- 明示的なリソース管理
+- 組み込み・エッジ用途向け設計
 
 ---
 
-## サンプル（高レベルAPI）
+# 🚀 クイックスタート
+
+YOLOで物体検出：
 
 ```nim
-import hailort_nim
+let detector = Detector.open("yolov11n.hef").get()
+let detections = detector.detectNmsByClassAuto(input).get()
 
-let det = Detector.open("model.hef").get
-let res = det.detectNmsByClass(input).get
-
-for d in res:
-  echo d.classId, " ", d.score
+echo detections[0].classId
 ```
 
----
+出力例：
 
-## 実行結果例
-
-```
-Input frame size:  1228800
-Output frame size: 160320
-Detection count: 1
-[ 0] class=16 label=dog             score=0.8432 box=(0.0045, 0.0242, 1.0003, 0.9705)
+```text
+dog
 ```
 
----
-
-## サンプル画像
-
+📷 サンプル画像：
 ![dog](examples/dog.jpg)
 
 ---
 
-## 画像の変換方法
+# ⚠️ 重要: open/close をループで使わない
 
-```bash
-convert dog.jpg -resize 640x640! rgb:dog.raw
+❌ NG例：
+
+```nim
+for frame in stream:
+  let d = Detector.open("model.hef")
+  d.detect(...)
+  d.close()
+```
+
+問題：
+
+- SRAMが解放されず蓄積
+- 最終的にエラー：
+  - HAILO_OUT_OF_PHYSICAL_DEVICES
+  - SRAM_FULL
+
+---
+
+# ✅ 新機能: 高速モデル切替 (activate/deactivate)
+
+## コンセプト
+
+```text
+openPrepared（1回）→ activate → 推論 → deactivate
+```
+
+## 使用例
+
+```nim
+let runtime = HailoRuntime.open().get()
+
+let detA = Detector.openPrepared(runtime, "a.hef").get()
+let detB = Detector.openPrepared(runtime, "b.hef").get()
+
+while true:
+  detA.activate().check()
+  detA.detect(...)
+  detA.deactivate().check()
+
+  detB.activate().check()
+  detB.detect(...)
+  detB.deactivate().check()
 ```
 
 ---
 
-## 実行方法
+# ⏱ パフォーマンス
 
-### 高レベルAPI
+(HAILO-8L + YOLOv11n)
 
-```
-nim c -r examples/infer_high_ex1.nim -- model.hef examples/dog.raw
-```
+| 処理 | 時間 |
+|------|------|
+| prepare | 約150〜400 ms |
+| activate | 約2〜3 ms |
+| deactivate | 約1 ms |
+| 推論 | 約30 ms |
 
-### 低レベルAPI
+👉 モデル切替は「ロード」ではなく
 
-```
-nim c -r examples/infer_raw.nim -- model.hef examples/dog.raw
+```text
+コンテキスト切替のみ
 ```
 
 ---
 
-## 構成
+# 🧠 モデル常駐数
 
-- bindings/      → C API（自動生成）
-- lowlevel/      → 薄いラッパ
-- highlevel/     → Detector API
-- postprocess/   → NMS処理
+テスト結果：
 
----
+- yolov11n.hef (~12MB)
+- 最大12モデル常駐可能
 
-## 状態
+※ 注意
 
-- 推論: OK
-- NMS: OK
-- Detector API: OK
+- HEFサイズ ≠ 実メモリ使用量
+- Hailoはストリーミング実行
 
 ---
 
-## 注意
+# 🧩 API概要
 
-非公式プロジェクトです。
+## 単一モデル
+
+```nim
+Detector.open()
+```
+
+## 複数モデル
+
+```nim
+Detector.openPrepared()
+activate()
+deactivate()
+```
+
+---
+
+# 🎯 設計思想
+
+```text
+一度ロードして使い回す
+```
+
+---
+
+# まとめ
+
+- クイックスタートはそのまま使える
+- ループでopen/closeは絶対NG
+- マルチモデルはactivate切替
+
+→ 安定・高速に動作
