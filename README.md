@@ -1,101 +1,180 @@
 # hailort_nim
 
-Unofficial Nim bindings and high-level API for HailoRT.
+## Overview
 
-🇯🇵 Japanese version → README.ja.md
+`hailort_nim` is a Nim binding for HailoRT, providing both low-level and high-level APIs for running inference on HAILO-8 / HAILO-8L devices.
 
----
-
-## Why?
-
-- Python is convenient, but heavy
-- C++ works, but CMake is painful
-- Simple inference requires too much boilerplate
-
-`hailort_nim` focuses on minimal, readable inference.
+- Zero-copy oriented API
+- Low-latency inference
+- Explicit resource control
+- Designed for embedded / edge environments
 
 ---
 
-## Example (High-level API)
+# 🚀 Quick Start
+
+Run object detection with YOLO:
 
 ```nim
-import hailort_nim
+let detector = Detector.open("yolov11n.hef").get()
+let detections = detector.detectNmsByClassAuto(input).get()
 
-let det = Detector.open("model.hef").get
-let res = det.detectNmsByClass(input).get
-
-for d in res:
-  echo d.classId, " ", d.score
+echo detections[0].classId
 ```
 
----
+Example output:
 
-## Example Output
-
-```
-Input frame size:  1228800
-Output frame size: 160320
-Detection count: 1
-[ 0] class=16 label=dog             score=0.8432 box=(0.0045, 0.0242, 1.0003, 0.9705)
+```text
+dog
 ```
 
----
-
-## Included Example
-
-Input image:
-
+📷 Example image:
 ![dog](examples/dog.jpg)
 
 ---
 
-## Convert Image to Raw
+# ⚠️ Important: DO NOT use open/close in a loop
 
-```bash
-convert dog.jpg -resize 640x640! rgb:dog.raw
+This is **very important**.
+
+❌ Bad:
+
+```nim
+for frame in stream:
+  let d = Detector.open("model.hef")
+  d.detect(...)
+  d.close()
+```
+
+This causes:
+
+- SRAM accumulation
+- Eventually:
+  - HAILO_OUT_OF_PHYSICAL_DEVICES
+  - SRAM_FULL
+
+---
+
+# ✅ New Feature: Fast Model Switching (activate/deactivate)
+
+This repository introduces a **correct and efficient way to use multiple models**.
+
+## Concept
+
+```text
+openPrepared (once) → activate → infer → deactivate
+```
+
+## Example
+
+```nim
+let runtime = HailoRuntime.open().get()
+
+let detA = Detector.openPrepared(runtime, "a.hef").get()
+let detB = Detector.openPrepared(runtime, "b.hef").get()
+
+while true:
+  detA.activate().check()
+  detA.detect(...)
+  detA.deactivate().check()
+
+  detB.activate().check()
+  detB.detect(...)
+  detB.deactivate().check()
 ```
 
 ---
 
-## Examples
+# ⏱ Performance
 
-### High-level (recommended)
+Measured (HAILO-8L + YOLOv11n):
 
-```
-nim c -r examples/infer_high_ex1.nim -- model.hef examples/dog.raw
-```
+| Operation        | Time |
+|-----------------|------|
+| prepare         | ~150–400 ms |
+| activate        | ~2–3 ms |
+| deactivate      | ~1 ms |
+| inference       | ~30 ms |
 
-### Low-level (debug)
+### Key Point
 
-```
-nim c -r examples/infer_raw.nim -- model.hef examples/dog.raw
+👉 Model switching is **NOT loading**
+
+It is:
+
+```text
+context switch only
 ```
 
 ---
 
-## Project Structure
+# 🧠 Model Capacity
 
-- bindings/      → auto-generated C bindings
-- lowlevel/      → thin wrappers
-- highlevel/     → Detector API
-- postprocess/   → NMS parsing
+Test result:
 
----
+- yolov11n.hef (~12MB)
+- 12 models prepared simultaneously
+- All models can run via activate/deactivate
 
-## Status
+### Important
 
-- YOLO inference: working
-- Detector API: working
-- NMS parsing: working
-
----
-
-## License
-
-MIT
+- HEF size ≠ runtime memory usage
+- Hailo uses streaming / partitioned execution
+- Actual memory footprint is much smaller
 
 ---
 
-## Disclaimer
+# 🧩 API Summary
 
-Unofficial project. Not affiliated with Hailo.
+## Simple (single model)
+
+```nim
+Detector.open()
+Detector.detect()
+```
+
+## Advanced (multi-model)
+
+```nim
+Detector.openPrepared()
+detector.activate()
+detector.deactivate()
+```
+
+---
+
+# 🎯 Design Philosophy
+
+Hailo is designed for:
+
+```text
+Load once → reuse → switch context
+```
+
+NOT:
+
+```text
+Load → run → unload
+```
+
+---
+
+# 📦 Future Work
+
+- Vision pipeline (GStreamer integration)
+- Multi-model scheduler
+- Pose / segmentation support
+
+---
+
+# Summary
+
+- Keep Quick Start simple
+- NEVER use open/close in loops
+- Use activate/deactivate for multi-model
+
+This enables:
+
+- Stable execution
+- Low latency switching
+- Efficient multi-model inference
