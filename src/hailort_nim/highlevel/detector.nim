@@ -1,4 +1,4 @@
-import std/[algorithm, sequtils, strformat]
+import std/[algorithm, strformat]
 
 import ../lowlevel
 import ../models/detection
@@ -29,15 +29,22 @@ proc readF32Le(data: openArray[byte]; offset: int): float32 =
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
-proc parseNmsByClassVariable(raw: openArray[byte], numberOfClasses: int,
-    maxBboxesPerClass: int): seq[Detection] =
-  ## Parse HAILO_FORMAT_ORDER_HAILO_NMS_BY_CLASS variable-length layout.
+proc parseNmsByClassVariableInto*(raw: openArray[byte], numberOfClasses: int,
+    maxBboxesPerClass: int, detections: var seq[Detection],
+    appScoreThreshold = 0.25'f32) =
+  ## Parse HAILO_FORMAT_ORDER_HAILO_NMS_BY_CLASS variable-length layout into
+  ## a caller-provided detection sequence.
+  ##
+  ## The sequence is cleared but its capacity is kept, allowing callers to reuse
+  ## the same storage across streaming inference loops.
+  detections.setLen(0)
+
   var offset = 0
   let rawLen = raw.len
 
   for classId in 0..<numberOfClasses:
     if offset + 4 > rawLen:
-      return result
+      return
 
     let countF = readF32Le(raw, offset)
     offset += 4
@@ -50,7 +57,7 @@ proc parseNmsByClassVariable(raw: openArray[byte], numberOfClasses: int,
 
     for _ in 0..<count:
       if offset + 20 > rawLen:
-        return result
+        return
 
       let yMin = readF32Le(raw, offset + 0)
       let xMin = readF32Le(raw, offset + 4)
@@ -59,9 +66,27 @@ proc parseNmsByClassVariable(raw: openArray[byte], numberOfClasses: int,
       let score = readF32Le(raw, offset + 16)
       offset += 20
 
-      let detection = Detection(classId: classId, score: score,
-          yMin: yMin, xMin: xMin, yMax: yMax, xMax: xMax)
-      result.add(detection)
+      if appScoreThreshold <= 0 or score >= appScoreThreshold:
+        let detection = Detection(classId: classId, score: score,
+            yMin: yMin, xMin: xMin, yMax: yMax, xMax: xMax)
+        detections.add(detection)
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc parseNmsByClassVariable*(raw: openArray[byte], numberOfClasses: int,
+    maxBboxesPerClass: int, appScoreThreshold = 0.25'f32): seq[Detection] =
+  ## Parse HAILO_FORMAT_ORDER_HAILO_NMS_BY_CLASS variable-length layout.
+  ##
+  ## This allocation-returning wrapper is kept for compatibility. Streaming code
+  ## should prefer parseNmsByClassVariableInto().
+  parseNmsByClassVariableInto(
+    raw,
+    numberOfClasses,
+    maxBboxesPerClass,
+    result,
+    appScoreThreshold
+  )
 
 # ------------------------------------------------------------------------------
 #
@@ -506,10 +531,12 @@ proc detectNmsByClass*(d: Detector, input: openArray[byte],
   let numClasses = int(nmsShape.number_of_classes)
   let maxBoxes = int(nmsShape.max_bboxes_per_class)
 
-  var detections = parseNmsByClassVariable(rawRes.get, numClasses, maxBoxes)
-  if appScoreThreshold > 0:
-    detections = detections.filterIt(it.score >= appScoreThreshold)
-
+  var detections = parseNmsByClassVariable(
+    rawRes.get,
+    numClasses,
+    maxBoxes,
+    appScoreThreshold
+  )
   detections.sortByScoreDesc()
   result = detections.ok
 
@@ -535,10 +562,12 @@ proc detectNmsByClassNhwc4*(d: Detector, input: openArray[byte],
   let numClasses = int(nmsShape.number_of_classes)
   let maxBoxes = int(nmsShape.max_bboxes_per_class)
 
-  var detections = parseNmsByClassVariable(rawRes.get, numClasses, maxBoxes)
-  if appScoreThreshold > 0:
-    detections = detections.filterIt(it.score >= appScoreThreshold)
-
+  var detections = parseNmsByClassVariable(
+    rawRes.get,
+    numClasses,
+    maxBoxes,
+    appScoreThreshold
+  )
   detections.sortByScoreDesc()
   result = detections.ok
 
