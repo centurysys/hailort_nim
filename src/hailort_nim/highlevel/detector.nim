@@ -6,6 +6,8 @@ import ../models/detection
 type
   Detector* = ref object
     hef*: Hef
+    runtime*: HailoRuntime
+    ownsRuntime*: bool
     vdevice*: Vdevice
     networkGroup*: NetworkGroup
     activated*: ActivatedNetworkGroup
@@ -187,23 +189,33 @@ proc close*(d: Detector): HE[void] =
     let res = d.activated.close()
     if res.isErr:
       return res
+    d.activated = nil
 
   if not d.inputVstreams.isNil:
     let res = d.inputVstreams.close()
     if res.isErr:
       return res
+    d.inputVstreams = nil
 
   if not d.outputVstreams.isNil:
     let res = d.outputVstreams.close()
     if res.isErr:
       return res
+    d.outputVstreams = nil
 
   if not d.networkGroup.isNil:
     let res = d.networkGroup.close()
     if res.isErr:
       return res
+    d.networkGroup = nil
 
-  if not d.vdevice.isNil:
+  if d.ownsRuntime and not d.runtime.isNil:
+    let res = d.runtime.close()
+    if res.isErr:
+      return res
+  elif d.runtime.isNil and not d.vdevice.isNil:
+    ## Compatibility fallback for Detector values constructed before
+    ## HailoRuntime existed, or manually assembled in tests.
     let res = d.vdevice.close()
     if res.isErr:
       return res
@@ -220,6 +232,8 @@ proc close*(d: Detector): HE[void] =
   d.outputVstream = nil
   d.networkGroup = nil
   d.vdevice = nil
+  d.runtime = nil
+  d.ownsRuntime = false
   d.hef = nil
 
   okVoid()
@@ -227,31 +241,27 @@ proc close*(d: Detector): HE[void] =
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
-proc open*(_: typedesc[Detector], hefPath: string,
-    hailoNmsScoreThreshold = -1.0'f32,
-    schedulingAlgorithm: SchedulingAlgorithm =
-        HAILO_SCHEDULING_ALGORITHM_NONE): HE[Detector] =
+proc open*(_: typedesc[Detector], runtime: HailoRuntime, hefPath: string,
+    hailoNmsScoreThreshold = -1.0'f32): HE[Detector] =
+  ## Open a detector using an existing shared HailoRuntime.
+  ##
+  ## The detector borrows the runtime/vdevice. Closing the detector releases the
+  ## model resources but does not close the shared runtime.
+  if runtime.isNil or not runtime.isOpen():
+    return makeError(HAILO_INVALID_ARGUMENT, "runtime is not open").err
+
   let hefRes = openHef(hefPath)
   if hefRes.isErr:
     return hefRes.error.err
   let hefObj = hefRes.get
 
-  var vdevParamsRes = initVdeviceParams()
-  if vdevParamsRes.isErr:
+  let vdevObj = runtime.rawVdevice()
+  if vdevObj.isNil or vdevObj.rawHandle.isNil:
     discard hefObj.close()
-    return vdevParamsRes.error.err
-  var vdevParams = vdevParamsRes.get
-  vdevParams.scheduling_algorithm = schedulingAlgorithm
-
-  let vdevRes = createVdevice(vdevParams)
-  if vdevRes.isErr:
-    discard hefObj.close()
-    return vdevRes.error.err
-  let vdevObj = vdevRes.get
+    return makeError(HAILO_INVALID_ARGUMENT, "runtime vdevice is nil").err
 
   let ngRes = configureOne(vdevObj, hefObj)
   if ngRes.isErr:
-    discard vdevObj.close()
     discard hefObj.close()
     return ngRes.error.err
   let ngObj = ngRes.get
@@ -259,7 +269,6 @@ proc open*(_: typedesc[Detector], hefPath: string,
   let inputParamsRes = makeInputVstreamParams(ngObj)
   if inputParamsRes.isErr:
     discard ngObj.close()
-    discard vdevObj.close()
     discard hefObj.close()
     return inputParamsRes.error.err
   let inputParams = inputParamsRes.get
@@ -267,14 +276,12 @@ proc open*(_: typedesc[Detector], hefPath: string,
   let outputParamsRes = makeOutputVstreamParams(ngObj)
   if outputParamsRes.isErr:
     discard ngObj.close()
-    discard vdevObj.close()
     discard hefObj.close()
     return outputParamsRes.error.err
   let outputParams = outputParamsRes.get
 
   if inputParams.len != 1:
     discard ngObj.close()
-    discard vdevObj.close()
     discard hefObj.close()
     return makeError(
       HAILO_INVALID_OPERATION,
@@ -283,7 +290,6 @@ proc open*(_: typedesc[Detector], hefPath: string,
 
   if outputParams.len != 1:
     discard ngObj.close()
-    discard vdevObj.close()
     discard hefObj.close()
     return makeError(
       HAILO_INVALID_OPERATION,
@@ -293,7 +299,6 @@ proc open*(_: typedesc[Detector], hefPath: string,
   let inputVstreamsRes = createInputVstreams(ngObj, inputParams)
   if inputVstreamsRes.isErr:
     discard ngObj.close()
-    discard vdevObj.close()
     discard hefObj.close()
     return inputVstreamsRes.error.err
   let inputVstreams = inputVstreamsRes.get
@@ -302,7 +307,6 @@ proc open*(_: typedesc[Detector], hefPath: string,
   if outputVstreamsRes.isErr:
     discard inputVstreams.close()
     discard ngObj.close()
-    discard vdevObj.close()
     discard hefObj.close()
     return outputVstreamsRes.error.err
   let outputVstreams = outputVstreamsRes.get
@@ -315,7 +319,6 @@ proc open*(_: typedesc[Detector], hefPath: string,
     discard outputVstreams.close()
     discard inputVstreams.close()
     discard ngObj.close()
-    discard vdevObj.close()
     discard hefObj.close()
     return inputInfoRes.error.err
   let inputInfo = inputInfoRes.get
@@ -325,7 +328,6 @@ proc open*(_: typedesc[Detector], hefPath: string,
     discard outputVstreams.close()
     discard inputVstreams.close()
     discard ngObj.close()
-    discard vdevObj.close()
     discard hefObj.close()
     return outputInfoRes.error.err
   let outputInfo = outputInfoRes.get
@@ -335,7 +337,6 @@ proc open*(_: typedesc[Detector], hefPath: string,
     discard outputVstreams.close()
     discard inputVstreams.close()
     discard ngObj.close()
-    discard vdevObj.close()
     discard hefObj.close()
     return inputFrameSizeRes.error.err
   let inputFrameSize = inputFrameSizeRes.get
@@ -345,7 +346,6 @@ proc open*(_: typedesc[Detector], hefPath: string,
     discard outputVstreams.close()
     discard inputVstreams.close()
     discard ngObj.close()
-    discard vdevObj.close()
     discard hefObj.close()
     return outputFrameSizeRes.error.err
   let outputFrameSize = outputFrameSizeRes.get
@@ -356,7 +356,6 @@ proc open*(_: typedesc[Detector], hefPath: string,
       discard outputVstreams.close()
       discard inputVstreams.close()
       discard ngObj.close()
-      discard vdevObj.close()
       discard hefObj.close()
       return setThRes.error.err
 
@@ -365,12 +364,13 @@ proc open*(_: typedesc[Detector], hefPath: string,
     discard outputVstreams.close()
     discard inputVstreams.close()
     discard ngObj.close()
-    discard vdevObj.close()
     discard hefObj.close()
     return activatedRes.error.err
 
   result = Detector(
     hef: hefObj,
+    runtime: runtime,
+    ownsRuntime: false,
     vdevice: vdevObj,
     networkGroup: ngObj,
     activated: activatedRes.get,
@@ -383,6 +383,35 @@ proc open*(_: typedesc[Detector], hefPath: string,
     inputFrameSize: inputFrameSize,
     outputFrameSize: outputFrameSize
   ).ok
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc open*(_: typedesc[Detector], hefPath: string,
+    hailoNmsScoreThreshold = -1.0'f32,
+    schedulingAlgorithm: SchedulingAlgorithm =
+        HAILO_SCHEDULING_ALGORITHM_NONE): HE[Detector] =
+  ## Compatibility wrapper that creates and owns a private HailoRuntime.
+  ##
+  ## For multiple models, prefer creating one HailoRuntime and passing it to
+  ## Detector.open(runtime, hefPath, ...).
+  let runtimeRes = HailoRuntime.open(schedulingAlgorithm)
+  if runtimeRes.isErr:
+    return runtimeRes.error.err
+  let runtime = runtimeRes.get
+
+  let detRes = Detector.open(
+    runtime = runtime,
+    hefPath = hefPath,
+    hailoNmsScoreThreshold = hailoNmsScoreThreshold
+  )
+  if detRes.isErr:
+    discard runtime.close()
+    return detRes.error.err
+
+  let det = detRes.get
+  det.ownsRuntime = true
+  result = det.ok
 
 # ------------------------------------------------------------------------------
 #
