@@ -1,28 +1,36 @@
 import std/net
+
 import ../bindings/[c_api, types]
 import ../internal/[error, helper]
 
 # ==============================================================================
 # Public type aliases
 # ==============================================================================
+
 type
   DeviceObj* = object
     dev*: hailo_device
+    owned*: bool
+
   Device* = ref DeviceObj
 
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
 proc `=destroy`(obj: var DeviceObj) =
-  if obj.dev != nil:
+  if obj.owned and obj.dev != nil:
     discard hailo_release_device(obj.dev)
-    obj.dev = nil
+  obj.dev = nil
 
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
 proc close*(device: Device): HE[void] =
   if device.isNil or device.dev.isNil:
+    return okVoid()
+
+  if not device.owned:
+    device.dev = nil
     return okVoid()
 
   let res = hailo_release_device(device.dev)
@@ -102,8 +110,8 @@ proc scanDevices*(): HE[seq[DeviceId]] =
   while true:
     var ids = newSeq[DeviceId](int(count))
     var actualCount = count
-    let res = hailo_scan_devices(nil, ids[0].addr, addr actualCount)
 
+    let res = hailo_scan_devices(nil, ids[0].addr, addr actualCount)
     if res == HAILO_INSUFFICIENT_BUFFER:
       count = actualCount
       continue
@@ -123,8 +131,8 @@ proc scanPcieDevices*(): HE[seq[PcieDeviceInfo]] =
   while true:
     var infos = newSeq[PcieDeviceInfo](int(count))
     var actualCount: csize_t
-    let res = hailo_scan_pcie_devices(infos[0].addr, count, addr actualCount)
 
+    let res = hailo_scan_pcie_devices(infos[0].addr, count, addr actualCount)
     if res == HAILO_INSUFFICIENT_BUFFER:
       count = actualCount
       continue
@@ -138,16 +146,20 @@ proc scanPcieDevices*(): HE[seq[PcieDeviceInfo]] =
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
-proc scanEthernetDevices*(interfaceName: string, timeoutMs = 1000'u32):
-    HE[seq[EthDeviceInfo]] =
+proc scanEthernetDevices*(interfaceName: string, timeoutMs = 1000'u32): HE[seq[EthDeviceInfo]] =
   var count: csize_t = 8
 
   while true:
     var infos = newSeq[EthDeviceInfo](int(count))
     var actualCount: csize_t
-    let res = hailo_scan_ethernet_devices(interfaceName.cstring, infos[0].addr,
-        count, addr actualCount, timeoutMs)
 
+    let res = hailo_scan_ethernet_devices(
+      interfaceName.cstring,
+      infos[0].addr,
+      count,
+      addr actualCount,
+      timeoutMs,
+    )
     if res == HAILO_INSUFFICIENT_BUFFER:
       count = actualCount
       continue
@@ -176,7 +188,7 @@ proc createAnyDevice*(): HE[Device] =
   let res = hailo_create_device_by_id(nil, addr dev)
   if res != HAILO_SUCCESS:
     return makeError(res, $res).err
-  (Device(dev: dev)).ok
+  (Device(dev: dev, owned: true)).ok
 
 # ------------------------------------------------------------------------------
 #
@@ -187,7 +199,7 @@ proc createDeviceById*(id: DeviceId): HE[Device] =
   let res = hailo_create_device_by_id(addr tmp, addr dev)
   if res != HAILO_SUCCESS:
     return makeError(res, $res).err
-  (Device(dev: dev)).ok
+  (Device(dev: dev, owned: true)).ok
 
 # ------------------------------------------------------------------------------
 #
@@ -198,7 +210,7 @@ proc createPcieDevice*(info: PcieDeviceInfo): HE[Device] =
   let res = hailo_create_pcie_device(addr tmp, addr dev)
   if res != HAILO_SUCCESS:
     return makeError(res, $res).err
-  (Device(dev: dev)).ok
+  (Device(dev: dev, owned: true)).ok
 
 # ------------------------------------------------------------------------------
 #
@@ -208,7 +220,7 @@ proc createAnyPcieDevice*(): HE[Device] =
   let res = hailo_create_pcie_device(nil, addr dev)
   if res != HAILO_SUCCESS:
     return makeError(res, $res).err
-  (Device(dev: dev)).ok
+  (Device(dev: dev, owned: true)).ok
 
 # ------------------------------------------------------------------------------
 #
@@ -219,7 +231,7 @@ proc createEthernetDevice*(info: EthDeviceInfo): HE[Device] =
   let res = hailo_create_ethernet_device(addr tmp, addr dev)
   if res != HAILO_SUCCESS:
     return makeError(res, $res).err
-  (Device(dev: dev)).ok
+  (Device(dev: dev, owned: true)).ok
 
 # ==============================================================================
 # Queries / control
@@ -289,6 +301,80 @@ proc getChipTemperature*(device: Device): HE[ChipTemperatureInfo] =
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
+proc powerMeasurement*(
+    device: Device,
+    dvm: DvmOptions = HAILO_DVM_OPTIONS_AUTO,
+    measurementType: PowerMeasurementType = HAILO_POWER_MEASUREMENT_TYPES_POWER,
+): HE[float32] =
+  var measurement: float32
+  let res = hailo_power_measurement(
+    device.rawHandle,
+    dvm,
+    measurementType,
+    addr measurement,
+  )
+  if res != HAILO_SUCCESS:
+    return makeError(res, $res).err
+  measurement.ok
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc startPowerMeasurement*(
+    device: Device,
+    averagingFactor: AveragingFactor = HAILO_DEFAULT_INIT_AVERAGING_FACTOR,
+    samplingPeriod: SamplingPeriod = HAILO_DEFAULT_INIT_SAMPLING_PERIOD_US,
+): HE[void] =
+  check(hailo_start_power_measurement(
+    device.rawHandle,
+    averagingFactor,
+    samplingPeriod,
+  ))
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc setPowerMeasurement*(
+    device: Device,
+    bufferIndex: MeasurementBufferIndex = HAILO_MEASUREMENT_BUFFER_INDEX_0,
+    dvm: DvmOptions = HAILO_DVM_OPTIONS_AUTO,
+    measurementType: PowerMeasurementType = HAILO_POWER_MEASUREMENT_TYPES_POWER,
+): HE[void] =
+  check(hailo_set_power_measurement(
+    device.rawHandle,
+    bufferIndex,
+    dvm,
+    measurementType,
+  ))
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc getPowerMeasurement*(
+    device: Device,
+    bufferIndex: MeasurementBufferIndex = HAILO_MEASUREMENT_BUFFER_INDEX_0,
+    shouldClear = true,
+): HE[PowerMeasurementData] =
+  var data: PowerMeasurementData
+  let res = hailo_get_power_measurement(
+    device.rawHandle,
+    bufferIndex,
+    shouldClear,
+    addr data,
+  )
+  if res != HAILO_SUCCESS:
+    return makeError(res, $res).err
+  data.ok
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc stopPowerMeasurement*(device: Device): HE[void] =
+  check(hailo_stop_power_measurement(device.rawHandle))
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
 proc getThrottlingState*(device: Device): HE[bool] =
   var isActive = false
   let res = hailo_get_throttling_state(device.rawHandle, addr isActive)
@@ -305,8 +391,7 @@ proc setThrottlingState*(device: Device, shouldActivate: bool): HE[void] =
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
-proc setFwLogger*(device: Device, level: FwLoggerLevel, interfaceMask: uint32):
-    HE[void] =
+proc setFwLogger*(device: Device, level: FwLoggerLevel, interfaceMask: uint32): HE[void] =
   check(hailo_set_fw_logger(device.rawHandle, level, interfaceMask))
 
 # ------------------------------------------------------------------------------
@@ -321,8 +406,8 @@ proc reset*(device: Device, mode: ResetDeviceMode): HE[void] =
 proc updateFirmware*(device: Device, firmware: openArray[byte]): HE[void] =
   if firmware.len == 0:
     return makeError(HAILO_INVALID_ARGUMENT, "firmware buffer is empty").err
-  check(hailo_update_firmware(device.rawHandle, unsafeAddr firmware[0],
-      uint32(firmware.len)))
+
+  check(hailo_update_firmware(device.rawHandle, unsafeAddr firmware[0], uint32(firmware.len)))
 
 # ------------------------------------------------------------------------------
 #
@@ -330,14 +415,12 @@ proc updateFirmware*(device: Device, firmware: openArray[byte]): HE[void] =
 proc updateSecondStage*(device: Device, secondStage: openArray[byte]): HE[void] =
   if secondStage.len == 0:
     return makeError(HAILO_INVALID_ARGUMENT, "second stage buffer is empty").err
-  check(hailo_update_second_stage(device.rawHandle, unsafeAddr secondStage[0],
-      uint32(secondStage.len)))
 
+  check(hailo_update_second_stage(device.rawHandle, unsafeAddr secondStage[0], uint32(secondStage.len)))
 
 when isMainModule:
   proc main() =
     echo "Scanning devices..."
-
     let res = scanDevices()
     if res.isErr:
       echo "Error: ", res.error
@@ -345,7 +428,6 @@ when isMainModule:
 
     let devs = res.get
     echo "Found devices: ", devs.len
-
     for d in devs:
       echo "- ", d
 
@@ -354,7 +436,6 @@ when isMainModule:
       quit 0
 
     echo "Creating first device..."
-
     let devRes = createDeviceById(devs[0])
     if devRes.isErr:
       echo "Error: ", devRes.error
