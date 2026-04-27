@@ -1,4 +1,5 @@
 import std/[algorithm, sequtils, strformat]
+
 import ../lowlevel
 import ../models/detection
 
@@ -33,25 +34,31 @@ proc parseNmsByClassVariable(raw: openArray[byte], numberOfClasses: int,
   ## Parse HAILO_FORMAT_ORDER_HAILO_NMS_BY_CLASS variable-length layout.
   var offset = 0
   let rawLen = raw.len
+
   for classId in 0..<numberOfClasses:
     if offset + 4 > rawLen:
       return result
+
     let countF = readF32Le(raw, offset)
     offset += 4
+
     var count = int(countF)
     if count < 0:
       count = 0
     if count > maxBboxesPerClass:
       count = maxBboxesPerClass
+
     for _ in 0..<count:
       if offset + 20 > rawLen:
         return result
+
       let yMin = readF32Le(raw, offset + 0)
       let xMin = readF32Le(raw, offset + 4)
       let yMax = readF32Le(raw, offset + 8)
       let xMax = readF32Le(raw, offset + 12)
       let score = readF32Le(raw, offset + 16)
       offset += 20
+
       let detection = Detection(classId: classId, score: score,
           yMin: yMin, xMin: xMin, yMax: yMax, xMax: xMax)
       result.add(detection)
@@ -126,7 +133,6 @@ proc outputPixelFormat*(d: Detector): HE[PixelFormat] =
     return mdRes.error.err
   result = mdRes.get.pixelFormat.ok
 
-
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
@@ -196,9 +202,10 @@ proc close*(d: Detector): HE[void] =
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
-proc open*(_: typedesc[Detector], hefPath: string, hailoNmsScoreThreshold = -1.0'f32,
-    schedulingAlgorithm: SchedulingAlgorithm = HAILO_SCHEDULING_ALGORITHM_NONE):
-    HE[Detector] =
+proc open*(_: typedesc[Detector], hefPath: string,
+    hailoNmsScoreThreshold = -1.0'f32,
+    schedulingAlgorithm: SchedulingAlgorithm =
+        HAILO_SCHEDULING_ALGORITHM_NONE): HE[Detector] =
   let hefRes = openHef(hefPath)
   if hefRes.isErr:
     return hefRes.error.err
@@ -337,12 +344,57 @@ proc open*(_: typedesc[Detector], hefPath: string, hailoNmsScoreThreshold = -1.0
     discard hefObj.close()
     return activatedRes.error.err
 
-  result = Detector(hef: hefObj, vdevice: vdevObj, networkGroup: ngObj,
-      activated: activatedRes.get, inputVstreams: inputVstreams,
-      outputVstreams: outputVstreams, inputVstream: inputVstream,
-      outputVstream: outputVstream, inputInfo: inputInfo,
-      outputInfo: outputInfo, inputFrameSize: inputFrameSize,
-      outputFrameSize: outputFrameSize).ok
+  result = Detector(
+    hef: hefObj,
+    vdevice: vdevObj,
+    networkGroup: ngObj,
+    activated: activatedRes.get,
+    inputVstreams: inputVstreams,
+    outputVstreams: outputVstreams,
+    inputVstream: inputVstream,
+    outputVstream: outputVstream,
+    inputInfo: inputInfo,
+    outputInfo: outputInfo,
+    inputFrameSize: inputFrameSize,
+    outputFrameSize: outputFrameSize
+  ).ok
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc validateOutputBuffer(d: Detector; outputLen: int): HE[void] =
+  if outputLen == 0:
+    return makeError(HAILO_INVALID_ARGUMENT, "output buffer is empty").err
+
+  if outputLen != d.outputFrameSize:
+    return makeError(
+      HAILO_INVALID_ARGUMENT,
+      &"output buffer size mismatch: expected={d.outputFrameSize} actual={outputLen}"
+    ).err
+
+  result = okVoid()
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc inferRawInto*(d: Detector; input: openArray[byte];
+    output: var openArray[byte]): HE[void] =
+  if d.isNil:
+    return makeError(HAILO_INVALID_ARGUMENT, "detector is nil").err
+
+  let validateInputRes = validateInputBuffer(d.inputInfo, input.len)
+  if validateInputRes.isErr:
+    return validateInputRes.error.err
+
+  let validateOutputRes = d.validateOutputBuffer(output.len)
+  if validateOutputRes.isErr:
+    return validateOutputRes.error.err
+
+  let writeRes = d.inputVstream.write(input)
+  if writeRes.isErr:
+    return writeRes.error.err
+
+  result = d.outputVstream.read(addr output[0], output.len)
 
 # ------------------------------------------------------------------------------
 #
@@ -351,15 +403,33 @@ proc inferRaw*(d: Detector; input: openArray[byte]): HE[seq[byte]] =
   if d.isNil:
     return makeError(HAILO_INVALID_ARGUMENT, "detector is nil").err
 
-  let validateRes = validateInputBuffer(d.inputInfo, input.len)
-  if validateRes.isErr:
-    return validateRes.error.err
+  if d.outputFrameSize == 0:
+    return makeError(HAILO_INVALID_ARGUMENT, "output size is zero").err
 
-  let writeRes = d.inputVstream.write(input)
+  var output = newSeq[byte](d.outputFrameSize)
+  let inferRes = d.inferRawInto(input, output)
+  if inferRes.isErr:
+    return inferRes.error.err
+
+  result = output.ok
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc inferNhwc4Into*(d: Detector; input: openArray[byte];
+    output: var openArray[byte]): HE[void] =
+  if d.isNil:
+    return makeError(HAILO_INVALID_ARGUMENT, "detector is nil").err
+
+  let validateOutputRes = d.validateOutputBuffer(output.len)
+  if validateOutputRes.isErr:
+    return validateOutputRes.error.err
+
+  let writeRes = d.inputVstream.writeNhwc4(input)
   if writeRes.isErr:
     return writeRes.error.err
 
-  result = d.outputVstream.read(d.outputFrameSize)
+  result = d.outputVstream.read(addr output[0], output.len)
 
 # ------------------------------------------------------------------------------
 #
@@ -368,16 +438,21 @@ proc inferNhwc4*(d: Detector; input: openArray[byte]): HE[seq[byte]] =
   if d.isNil:
     return makeError(HAILO_INVALID_ARGUMENT, "detector is nil").err
 
-  let writeRes = d.inputVstream.writeNhwc4(input)
-  if writeRes.isErr:
-    return writeRes.error.err
+  if d.outputFrameSize == 0:
+    return makeError(HAILO_INVALID_ARGUMENT, "output size is zero").err
 
-  result = d.outputVstream.read(d.outputFrameSize)
+  var output = newSeq[byte](d.outputFrameSize)
+  let inferRes = d.inferNhwc4Into(input, output)
+  if inferRes.isErr:
+    return inferRes.error.err
+
+  result = output.ok
 
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
-proc infer*(d: Detector; input: openArray[byte]): HE[seq[byte]] =
+proc inferInto*(d: Detector; input: openArray[byte];
+    output: var openArray[byte]): HE[void] =
   if d.isNil:
     return makeError(HAILO_INVALID_ARGUMENT, "detector is nil").err
 
@@ -388,9 +463,26 @@ proc infer*(d: Detector; input: openArray[byte]): HE[seq[byte]] =
 
   case md.imageType
   of itNhwc4:
-    result = d.inferNhwc4(input)
+    result = d.inferNhwc4Into(input, output)
   else:
-    result = d.inferRaw(input)
+    result = d.inferRawInto(input, output)
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc infer*(d: Detector; input: openArray[byte]): HE[seq[byte]] =
+  if d.isNil:
+    return makeError(HAILO_INVALID_ARGUMENT, "detector is nil").err
+
+  if d.outputFrameSize == 0:
+    return makeError(HAILO_INVALID_ARGUMENT, "output size is zero").err
+
+  var output = newSeq[byte](d.outputFrameSize)
+  let inferRes = d.inferInto(input, output)
+  if inferRes.isErr:
+    return inferRes.error.err
+
+  result = output.ok
 
 # ------------------------------------------------------------------------------
 #
