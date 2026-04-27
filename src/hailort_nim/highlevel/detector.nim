@@ -512,8 +512,7 @@ proc infer*(d: Detector; input: openArray[byte]): HE[seq[byte]] =
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
-proc detectNmsByClass*(d: Detector, input: openArray[byte],
-    appScoreThreshold = 0.25'f32): HE[seq[Detection]] =
+proc validateNmsByClassOutput(d: Detector): HE[void] =
   if d.isNil:
     return makeError(HAILO_INVALID_ARGUMENT, "detector is nil").err
 
@@ -523,59 +522,75 @@ proc detectNmsByClass*(d: Detector, input: openArray[byte],
       &"output format is not HAILO_FORMAT_ORDER_HAILO_NMS_BY_CLASS: got {ord(d.outputInfo.format.order)}"
     ).err
 
-  let rawRes = d.inferRaw(input)
-  if rawRes.isErr:
-    return rawRes.error.err
+  result = okVoid()
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc parseNmsOutputInto(d: Detector; output: openArray[byte];
+    detections: var seq[Detection]; appScoreThreshold: float32): HE[void] =
+  let validateRes = d.validateNmsByClassOutput()
+  if validateRes.isErr:
+    return validateRes.error.err
 
   let nmsShape = d.outputInfo.anon0.nms_shape
   let numClasses = int(nmsShape.number_of_classes)
   let maxBoxes = int(nmsShape.max_bboxes_per_class)
 
-  var detections = parseNmsByClassVariable(
-    rawRes.get,
+  parseNmsByClassVariableInto(
+    output,
     numClasses,
     maxBoxes,
+    detections,
     appScoreThreshold
   )
   detections.sortByScoreDesc()
-  result = detections.ok
+  result = okVoid()
 
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
-proc detectNmsByClassNhwc4*(d: Detector, input: openArray[byte],
-    appScoreThreshold = 0.25'f32): HE[seq[Detection]] =
+proc detectNmsByClassInto*(d: Detector; input: openArray[byte];
+    outputBuf: var openArray[byte]; detections: var seq[Detection];
+    appScoreThreshold = 0.25'f32): HE[void] =
   if d.isNil:
     return makeError(HAILO_INVALID_ARGUMENT, "detector is nil").err
 
-  if d.outputInfo.format.order != HAILO_FORMAT_ORDER_HAILO_NMS_BY_CLASS:
-    return makeError(
-      HAILO_INVALID_OPERATION,
-      &"output format is not HAILO_FORMAT_ORDER_HAILO_NMS_BY_CLASS: got {ord(d.outputInfo.format.order)}"
-    ).err
+  let validateRes = d.validateNmsByClassOutput()
+  if validateRes.isErr:
+    return validateRes.error.err
 
-  let rawRes = d.inferNhwc4(input)
-  if rawRes.isErr:
-    return rawRes.error.err
+  let inferRes = d.inferRawInto(input, outputBuf)
+  if inferRes.isErr:
+    return inferRes.error.err
 
-  let nmsShape = d.outputInfo.anon0.nms_shape
-  let numClasses = int(nmsShape.number_of_classes)
-  let maxBoxes = int(nmsShape.max_bboxes_per_class)
-
-  var detections = parseNmsByClassVariable(
-    rawRes.get,
-    numClasses,
-    maxBoxes,
-    appScoreThreshold
-  )
-  detections.sortByScoreDesc()
-  result = detections.ok
+  result = d.parseNmsOutputInto(outputBuf, detections, appScoreThreshold)
 
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
-proc detectNmsByClassAuto*(d: Detector, input: openArray[byte],
-    appScoreThreshold = 0.25'f32): HE[seq[Detection]] =
+proc detectNmsByClassNhwc4Into*(d: Detector; input: openArray[byte];
+    outputBuf: var openArray[byte]; detections: var seq[Detection];
+    appScoreThreshold = 0.25'f32): HE[void] =
+  if d.isNil:
+    return makeError(HAILO_INVALID_ARGUMENT, "detector is nil").err
+
+  let validateRes = d.validateNmsByClassOutput()
+  if validateRes.isErr:
+    return validateRes.error.err
+
+  let inferRes = d.inferNhwc4Into(input, outputBuf)
+  if inferRes.isErr:
+    return inferRes.error.err
+
+  result = d.parseNmsOutputInto(outputBuf, detections, appScoreThreshold)
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc detectNmsByClassAutoInto*(d: Detector; input: openArray[byte];
+    outputBuf: var openArray[byte]; detections: var seq[Detection];
+    appScoreThreshold = 0.25'f32): HE[void] =
   if d.isNil:
     return makeError(HAILO_INVALID_ARGUMENT, "detector is nil").err
 
@@ -586,8 +601,95 @@ proc detectNmsByClassAuto*(d: Detector, input: openArray[byte],
 
   case md.imageType
   of itNhwc4:
-    result = d.detectNmsByClassNhwc4(input, appScoreThreshold)
+    result = d.detectNmsByClassNhwc4Into(
+      input,
+      outputBuf,
+      detections,
+      appScoreThreshold
+    )
   of itNhwc3, itUnknown:
-    result = d.detectNmsByClass(input, appScoreThreshold)
+    result = d.detectNmsByClassInto(
+      input,
+      outputBuf,
+      detections,
+      appScoreThreshold
+    )
   else:
-    result = d.detectNmsByClass(input, appScoreThreshold)
+    result = d.detectNmsByClassInto(
+      input,
+      outputBuf,
+      detections,
+      appScoreThreshold
+    )
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc detectNmsByClass*(d: Detector, input: openArray[byte],
+    appScoreThreshold = 0.25'f32): HE[seq[Detection]] =
+  if d.isNil:
+    return makeError(HAILO_INVALID_ARGUMENT, "detector is nil").err
+
+  if d.outputFrameSize == 0:
+    return makeError(HAILO_INVALID_ARGUMENT, "output size is zero").err
+
+  var outputBuf = newSeq[byte](d.outputFrameSize)
+  var detections: seq[Detection] = @[]
+  let detectRes = d.detectNmsByClassInto(
+    input,
+    outputBuf,
+    detections,
+    appScoreThreshold
+  )
+  if detectRes.isErr:
+    return detectRes.error.err
+
+  result = detections.ok
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc detectNmsByClassNhwc4*(d: Detector, input: openArray[byte],
+    appScoreThreshold = 0.25'f32): HE[seq[Detection]] =
+  if d.isNil:
+    return makeError(HAILO_INVALID_ARGUMENT, "detector is nil").err
+
+  if d.outputFrameSize == 0:
+    return makeError(HAILO_INVALID_ARGUMENT, "output size is zero").err
+
+  var outputBuf = newSeq[byte](d.outputFrameSize)
+  var detections: seq[Detection] = @[]
+  let detectRes = d.detectNmsByClassNhwc4Into(
+    input,
+    outputBuf,
+    detections,
+    appScoreThreshold
+  )
+  if detectRes.isErr:
+    return detectRes.error.err
+
+  result = detections.ok
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc detectNmsByClassAuto*(d: Detector, input: openArray[byte],
+    appScoreThreshold = 0.25'f32): HE[seq[Detection]] =
+  if d.isNil:
+    return makeError(HAILO_INVALID_ARGUMENT, "detector is nil").err
+
+  if d.outputFrameSize == 0:
+    return makeError(HAILO_INVALID_ARGUMENT, "output size is zero").err
+
+  var outputBuf = newSeq[byte](d.outputFrameSize)
+  var detections: seq[Detection] = @[]
+  let detectRes = d.detectNmsByClassAutoInto(
+    input,
+    outputBuf,
+    detections,
+    appScoreThreshold
+  )
+  if detectRes.isErr:
+    return detectRes.error.err
+
+  result = detections.ok
