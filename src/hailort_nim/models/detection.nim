@@ -18,7 +18,7 @@ proc sortByScoreDesc*(detections: var seq[Detection]) =
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
-proc filterByScore*(detections: seq[Detection], threshold: float32): seq[Detection] =
+proc filterByScore*(detections: openArray[Detection], threshold: float32): seq[Detection] =
   result = newSeqOfCap[Detection](detections.len)
   for d in detections:
     if d.score >= threshold:
