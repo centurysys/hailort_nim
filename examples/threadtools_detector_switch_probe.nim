@@ -44,9 +44,6 @@ type
 proc elapsedMs(started: MonoTime): float {.inline.} =
   result = (getMonoTime() - started).inNanoseconds.float / 1_000_000.0
 
-proc elapsedUs(started: MonoTime): int64 {.inline.} =
-  result = inMicroseconds(getMonoTime() - started)
-
 proc parseBoolArg(s: string): bool =
   let v = s.toLowerAscii()
   result = v in ["1", "true", "yes", "y", "on"]

@@ -320,6 +320,20 @@ proc outputSize*(r: ThreadtoolsVStreamRunner): int =
 
   result = r.state.outputSize
 
+proc inputMetadata*(r: ThreadtoolsVStreamRunner): HE[VStreamMetadata] =
+  ## Return input vstream metadata for the source Detector.
+  if r.isNil or r.detector.isNil:
+    return makeError(HAILO_INVALID_ARGUMENT, "threadtools vstream runner detector is nil").err
+
+  result = r.detector.inputMetadata()
+
+proc outputMetadata*(r: ThreadtoolsVStreamRunner): HE[VStreamMetadata] =
+  ## Return output vstream metadata for the source Detector.
+  if r.isNil or r.detector.isNil:
+    return makeError(HAILO_INVALID_ARGUMENT, "threadtools vstream runner detector is nil").err
+
+  result = r.detector.outputMetadata()
+
 proc outputPtr*(r: ThreadtoolsVStreamRunner; slotIndex: int): pointer =
   if r.isNil or slotIndex < 0 or slotIndex >= r.state.slotCount:
     return nil

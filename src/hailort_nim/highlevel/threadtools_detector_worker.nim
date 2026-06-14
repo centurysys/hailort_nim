@@ -109,6 +109,31 @@ type
     closed: bool
 
 # ==============================================================================
+# Lifetime hooks
+# ==============================================================================
+
+proc `=destroy`*(self: var ThreadtoolsDetectorWorkerRequest) {.raises: [].} =
+  ## ThreadtoolsDetectorWorkerRequest can carry an active Pooled[seq[byte]].
+  ##
+  ## std/isolation checks the destructor effect of values passed through
+  ## ThreadQueue.sendMove().  Even a tdwrkReqStop value has the pooledInput field
+  ## at the type level, so relying on the compiler-generated object destructor can
+  ## produce an Effect warning when PoolItem's auto-return path is involved.
+  ##
+  ## Keep request destruction no-raise explicitly.  The active payload branch is
+  ## the only branch that owns non-trivial data.
+  try:
+    case self.kind
+    of tdwrkReqSeq:
+      `=destroy`(self.input)
+    of tdwrkReqPooledSeq:
+      `=destroy`(self.pooledInput)
+    of tdwrkReqStop:
+      `=destroy`(self.input)
+  except Exception:
+    discard
+
+# ==============================================================================
 # Small helpers
 # ==============================================================================
 
