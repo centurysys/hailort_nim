@@ -27,8 +27,10 @@ proc readFileBytes(path: string): seq[byte] =
 proc usage() =
   echo "Usage: threadtools_detector_worker_probe <hef> <raw-input> [loops] [slots] [queue] [score-threshold]"
   echo ""
+  echo "For a single-threaded submit/recv benchmark, use queue >= slots * 2."
+  echo ""
   echo "Example:"
-  echo "  threadtools_detector_worker_probe yolov11n.hef dog_640x640x3.raw 100 2 2 0.25"
+  echo "  threadtools_detector_worker_probe yolov11n.hef dog_640x640x3.raw 100 2 4 0.25"
 
 # ------------------------------------------------------------------------------
 # main
@@ -55,7 +57,7 @@ proc main() =
     if paramCount() >= 5:
       parseInt(paramStr(5))
     else:
-      2
+      recommendedThreadtoolsDetectorWorkerRequestQueueSize(slots)
   let threshold =
     if paramCount() >= 6:
       parseFloat(paramStr(6)).float32
@@ -66,6 +68,9 @@ proc main() =
     quit("loops must be positive", QuitFailure)
   if queueSize <= 0:
     quit("queue size must be positive", QuitFailure)
+
+  if queueSize <= slots:
+    echo &"note: queue={queueSize} <= slots={slots}; this benchmark may underfill HAILO. Use queue >= {slots * 2}."
 
   let inputTemplate = readFileBytes(rawPath)
   let det = getOrQuit(Detector.open(hefPath), "Detector.open")
@@ -103,12 +108,21 @@ proc main() =
   var lastDetectionCount = 0
   var lastTop: Detection
   var hasTop = false
+  var lastRequestId: uint64 = 0'u64
+  var lastUserData: uint64 = 0'u64
+
+  const userDataBase = 10_000'u64
 
   let started = getMonoTime()
 
   for _ in 0 ..< initial:
     quitIfErr(
-      worker.submitCopy(inputTemplate, uint64(submitted), threshold),
+      worker.submitCopy(
+        inputTemplate,
+        uint64(submitted),
+        threshold,
+        userDataBase + uint64(submitted)
+      ),
       "submitCopy"
     )
     inc submitted
@@ -124,6 +138,21 @@ proc main() =
       let err = reply.error.toHailoError()
       quit(&"worker request {reply.requestId} failed: {err}", QuitFailure)
     of tdwrkResult:
+      let expectedUserData = userDataBase + reply.requestId
+      if reply.userData != expectedUserData:
+        quit(
+          &"worker request {reply.requestId} returned unexpected userData: expected={expectedUserData} actual={reply.userData}",
+          QuitFailure
+        )
+      if reply.result.userData != reply.userData:
+        quit(
+          &"worker request {reply.requestId} result userData mismatch: reply={reply.userData} result={reply.result.userData}",
+          QuitFailure
+        )
+
+      lastRequestId = reply.requestId
+      lastUserData = reply.userData
+
       let timing = reply.result.timing
       totalWriteUs += timing.writeUs
       totalReadUs += timing.readUs
@@ -144,7 +173,12 @@ proc main() =
 
       if submitted < loops:
         quitIfErr(
-          worker.submitCopy(inputTemplate, uint64(submitted), threshold),
+          worker.submitCopy(
+            inputTemplate,
+            uint64(submitted),
+            threshold,
+            userDataBase + uint64(submitted)
+          ),
           "submitCopy"
         )
         inc submitted
@@ -168,6 +202,8 @@ proc main() =
   echo &"  wait min   : {float(minWaitUs) / 1000.0:.3f} ms"
   echo &"  wait max   : {float(maxWaitUs) / 1000.0:.3f} ms"
   echo &"  last det   : {lastDetectionCount}"
+  echo &"  last req   : {lastRequestId}"
+  echo &"  last data  : {lastUserData}"
 
   if hasTop:
     echo ""

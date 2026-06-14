@@ -32,13 +32,18 @@ type
     ##
     ## input is owned by the request.  Prefer submit(move input) for already
     ## owned seq[byte] buffers.  submitCopy() is provided for openArray callers.
+    ##
+    ## requestId and userData are opaque caller-supplied correlation fields.
+    ## Both are copied to the reply, including error replies.
     requestId*: uint64
+    userData*: uint64
     input*: seq[byte]
     appScoreThreshold*: float32
 
   ThreadtoolsDetectorWorkerResult* = object
     ## Successful inference result returned by ThreadtoolsDetectorWorker.
     requestId*: uint64
+    userData*: uint64
     timing*: ThreadtoolsDetectionResult
     detections*: seq[Detection]
 
@@ -59,10 +64,11 @@ type
     ## Reply moved from the detector worker to the caller/control thread.
     ##
     ## Job-level HAILO errors are reported as tdwrkError replies so the caller
-    ## can keep requestId association.  Queue/worker state errors are returned
+    ## can keep requestId/userData association.  Queue/worker state errors are returned
     ## from waitReply()/tryWaitReply() as HE errors.
     kind*: ThreadtoolsDetectorWorkerReplyKind
     requestId*: uint64
+    userData*: uint64
     result*: ThreadtoolsDetectorWorkerResult
     error*: ThreadtoolsDetectorWorkerError
 
@@ -124,21 +130,26 @@ proc toHailoError*(error: ThreadtoolsDetectorWorkerError): HailoError =
 
 proc makeErrorReply(
   requestId: uint64;
+  userData: uint64;
   error: HailoError
 ): ThreadtoolsDetectorWorkerReply =
   result.kind = tdwrkError
   result.requestId = requestId
+  result.userData = userData
   result.error = toWorkerError(error)
 
 proc makeResultReply(
   requestId: uint64;
+  userData: uint64;
   timing: ThreadtoolsDetectionResult;
   detections: sink seq[Detection]
 ): ThreadtoolsDetectorWorkerReply =
   result.kind = tdwrkResult
   result.requestId = requestId
+  result.userData = userData
   result.result = ThreadtoolsDetectorWorkerResult(
     requestId: requestId,
+    userData: userData,
     timing: timing,
     detections: move detections
   )
@@ -150,6 +161,7 @@ proc makeResultReply(
 type
   PendingRequest = object
     requestId: uint64
+    userData: uint64
     appScoreThreshold: float32
 
 proc sendWorkerReply(
@@ -172,12 +184,13 @@ proc handleSubmitRequest(
 
   let submitRes = state.detector.submit(ownedReq.input)
   if submitRes.isErr:
-    var reply = makeErrorReply(ownedReq.requestId, submitRes.error)
+    var reply = makeErrorReply(ownedReq.requestId, ownedReq.userData, submitRes.error)
     state.sendWorkerReply(move reply)
     return true
 
   pending.add PendingRequest(
     requestId: ownedReq.requestId,
+    userData: ownedReq.userData,
     appScoreThreshold: ownedReq.appScoreThreshold
   )
   result = true
@@ -254,7 +267,7 @@ proc detectorWorkerMain(state: ptr ThreadtoolsDetectorWorkerState) {.thread.} =
     pending.delete(0)
 
     if detectRes.isErr:
-      var reply = makeErrorReply(pendingReq.requestId, detectRes.error)
+      var reply = makeErrorReply(pendingReq.requestId, pendingReq.userData, detectRes.error)
       state.sendWorkerReply(move reply)
       continue
 
@@ -264,17 +277,37 @@ proc detectorWorkerMain(state: ptr ThreadtoolsDetectorWorkerState) {.thread.} =
     ## compatible with the Step 3 result shape.
     discard totalUs
 
-    var reply = makeResultReply(pendingReq.requestId, timing, move detections)
+    var reply = makeResultReply(
+      pendingReq.requestId,
+      pendingReq.userData,
+      timing,
+      move detections
+    )
     state.sendWorkerReply(move reply)
 
 # ==============================================================================
 # Configuration
 # ==============================================================================
 
-proc defaultThreadtoolsDetectorWorkerConfig*(): ThreadtoolsDetectorWorkerConfig =
+proc recommendedThreadtoolsDetectorWorkerRequestQueueSize*(slotCount: int): int =
+  ## Recommended request queue depth for benchmark-style single-threaded
+  ## submit/recv loops.
+  ##
+  ## A detector worker can keep up to slotCount HAILO requests in flight.  If the
+  ## caller submits the next request only after receiving a reply, a request
+  ## queue equal to slotCount can become empty at the exact moment the worker
+  ## tries to refill a slot.  Keeping at least another slotCount requests queued
+  ## avoids that saw-tooth underfill.
+  if slotCount <= 0:
+    return 2
+
+  result = max(2, slotCount * 2)
+
+proc defaultThreadtoolsDetectorWorkerConfig*(slotCount = 2): ThreadtoolsDetectorWorkerConfig =
+  let requestQueueSize = recommendedThreadtoolsDetectorWorkerRequestQueueSize(slotCount)
   result = ThreadtoolsDetectorWorkerConfig(
-    requestQueueSize: 2,
-    replyQueueSize: 3
+    requestQueueSize: requestQueueSize,
+    replyQueueSize: requestQueueSize + 1
   )
 
 proc validateConfig(config: ThreadtoolsDetectorWorkerConfig): HE[void] =
@@ -369,16 +402,22 @@ proc startThreadtoolsDetectorWorker*(
 proc startThreadtoolsDetectorWorker*(
   d: Detector;
   slotCount = 2;
-  requestQueueSize = 2
+  requestQueueSize = 0
 ): HE[ThreadtoolsDetectorWorker] =
   var runnerConfig = defaultThreadtoolsVStreamRunnerConfig()
   runnerConfig.slotCount = slotCount
   runnerConfig.inputQueueSize = slotCount
   runnerConfig.resultQueueSize = slotCount
 
-  var workerConfig = defaultThreadtoolsDetectorWorkerConfig()
-  workerConfig.requestQueueSize = requestQueueSize
-  workerConfig.replyQueueSize = requestQueueSize + 1
+  let effectiveRequestQueueSize =
+    if requestQueueSize > 0:
+      requestQueueSize
+    else:
+      recommendedThreadtoolsDetectorWorkerRequestQueueSize(slotCount)
+
+  var workerConfig = defaultThreadtoolsDetectorWorkerConfig(slotCount)
+  workerConfig.requestQueueSize = effectiveRequestQueueSize
+  workerConfig.replyQueueSize = effectiveRequestQueueSize + 1
 
   result = d.startThreadtoolsDetectorWorker(runnerConfig, workerConfig)
 
@@ -389,6 +428,7 @@ proc close*(w: ThreadtoolsDetectorWorker): HE[void] =
   if w.running:
     var stopReq = ThreadtoolsDetectorWorkerRequest(
       requestId: 0'u64,
+      userData: 0'u64,
       input: @[],
       appScoreThreshold: 0.0'f32
     )
@@ -456,7 +496,8 @@ proc submit*(
   w: ThreadtoolsDetectorWorker;
   input: sink seq[byte];
   requestId: uint64 = 0'u64;
-  appScoreThreshold = 0.25'f32
+  appScoreThreshold = 0.25'f32;
+  userData: uint64 = 0'u64
 ): HE[void] =
   ## Submit an owned seq[byte] input buffer to the detector worker.
   ##
@@ -480,6 +521,7 @@ proc submit*(
 
   var req = ThreadtoolsDetectorWorkerRequest(
     requestId: requestId,
+    userData: userData,
     input: move input,
     appScoreThreshold: appScoreThreshold
   )
@@ -493,7 +535,8 @@ proc submitCopy*(
   w: ThreadtoolsDetectorWorker;
   input: openArray[byte];
   requestId: uint64 = 0'u64;
-  appScoreThreshold = 0.25'f32
+  appScoreThreshold = 0.25'f32;
+  userData: uint64 = 0'u64
 ): HE[void] =
   ## Submit a borrowed input buffer by copying it into an owned seq[byte].
   ##
@@ -503,7 +546,7 @@ proc submitCopy*(
   if input.len > 0:
     copyMem(addr owned[0], unsafeAddr input[0], input.len)
 
-  result = w.submit(move owned, requestId, appScoreThreshold)
+  result = w.submit(move owned, requestId, appScoreThreshold, userData)
 
 proc waitReply*(
   w: ThreadtoolsDetectorWorker;
