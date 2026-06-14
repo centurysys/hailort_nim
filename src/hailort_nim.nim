@@ -15,5 +15,7 @@ when defined(hailortAsyncVstream):
 when defined(hailortThreadtools):
   import ./hailort_nim/highlevel/threadtools_vstream_runner
   import ./hailort_nim/highlevel/threadtools_detector
+  import ./hailort_nim/highlevel/threadtools_detector_worker
   export threadtools_vstream_runner
   export threadtools_detector
+  export threadtools_detector_worker
