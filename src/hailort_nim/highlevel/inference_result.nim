@@ -1,6 +1,9 @@
 import ../lowlevel
 import ../models/detection
 
+const
+  PoseKeypointCount* = 17
+
 # ==============================================================================
 # Generic inference result model
 # ==============================================================================
@@ -17,6 +20,7 @@ type
     hrkClassification
     hrkTextRegions
     hrkTextRecognition
+    hrkPose
     hrkRawTensor
 
   HailoInferenceTiming* = object
@@ -89,6 +93,32 @@ type
     confidence*: float32
     chars*: seq[RecognizedChar]
 
+  PoseKeypoint* = object
+    ## One COCO-style human pose keypoint in model/application coordinates.
+    x*: float32
+    y*: float32
+    score*: float32
+
+  PoseDetection* = object
+    ## One decoded human pose.
+    ##
+    ## bbox is an axis-aligned rectangle in model/application pixel coordinates.
+    ## keypoints uses the COCO 17-keypoint order:
+    ## nose, left/right eyes, left/right ears, shoulders, elbows, wrists, hips,
+    ## knees, and ankles.
+    score*: float32
+    classId*: int
+    bbox*: RectF32
+    center*: PointF32
+    sourceScale*: int
+    cellX*: int
+    cellY*: int
+    keypoints*: array[PoseKeypointCount, PoseKeypoint]
+
+  PoseResult* = object
+    ## Decoded pose-estimation result.
+    poses*: seq[PoseDetection]
+
   RawTensorBytes* = object
     ## Raw tensor byte storage that can safely move through ThreadQueue.
     ##
@@ -126,6 +156,7 @@ type
     classification*: ClassificationResult
     textRegions*: TextRegionResult
     text*: TextRecognitionResult
+    pose*: PoseResult
     raw*: RawTensorResult
 
 
@@ -213,6 +244,9 @@ proc initTextRecognitionResult*(
   result.confidence = confidence
   result.chars = move chars
 
+proc initPoseResult*(poses: sink seq[PoseDetection]): PoseResult =
+  result.poses = move poses
+
 proc initRawTensorResult*(
   outputName: string;
   outputSize: int;
@@ -245,6 +279,9 @@ proc clear*(r: var TextRecognitionResult) =
   r.confidence = 0.0'f32
   r.chars.setLen(0)
 
+proc clear*(r: var PoseResult) =
+  r.poses.setLen(0)
+
 proc clear*(r: var RawTensorResult) =
   r.outputName.setLen(0)
   r.outputSize = 0
@@ -261,6 +298,7 @@ proc clear*(r: var HailoInferenceResult) =
   r.classification.clear()
   r.textRegions.clear()
   r.text.clear()
+  r.pose.clear()
   r.raw.clear()
 
 proc resetKind*(r: var HailoInferenceResult; kind: HailoResultKind) =
@@ -320,6 +358,41 @@ proc byteAt*(b: var RawTensorBytes; index: int): byte =
 
   let p = cast[ptr UncheckedArray[byte]](b.data)
   result = p[index]
+
+# ==============================================================================
+# Pose compatibility helpers
+# ==============================================================================
+
+proc toDetection*(
+  pose: PoseDetection;
+  imageWidth: int;
+  imageHeight: int;
+  classId = 0
+): Detection =
+  ## Convert one PoseDetection into the existing normalized Detection shape.
+  ##
+  ## The keypoint data is intentionally dropped.  Use this only when generic
+  ## bbox-style consumers need a YOLO-like Detection view of pose results.
+  let w = max(1, imageWidth)
+  let h = max(1, imageHeight)
+  result.classId = classId
+  result.score = pose.score
+  result.xMin = pose.bbox.x / float32(w)
+  result.yMin = pose.bbox.y / float32(h)
+  result.xMax = (pose.bbox.x + pose.bbox.width) / float32(w)
+  result.yMax = (pose.bbox.y + pose.bbox.height) / float32(h)
+  result = result.clamped()
+
+proc toDetections*(
+  poses: openArray[PoseDetection];
+  imageWidth: int;
+  imageHeight: int;
+  classId = 0
+): seq[Detection] =
+  ## Convert pose results into YOLO-like normalized Detection records.
+  result = newSeqOfCap[Detection](poses.len)
+  for pose in poses:
+    result.add(pose.toDetection(imageWidth, imageHeight, classId))
 
 # ==============================================================================
 # Text region compatibility helpers

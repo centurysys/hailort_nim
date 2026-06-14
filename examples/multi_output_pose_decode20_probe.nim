@@ -53,9 +53,9 @@ type
     keypoints: array[KptCount, PoseKeypoint]
 
 proc usage() =
-  echo "Usage: multi_output_pose_decode20_probe <model.hef> <input_640x640_rgb.raw> [scoreThreshold] [topN] [overlay.ppm] [jointThreshold]"
+  echo "Usage: multi_output_pose_decode20_probe <model.hef> <input_640x640_rgb.raw> [scoreThreshold] [candidateLimit] [overlay.ppm] [jointThreshold] [iouThreshold] [maxPoses]"
   echo "Example:"
-  echo "  ./multi_output_pose_decode20_probe yolov8s_pose.hef pose_test_640x640_rgb.raw 0.25 20 pose_decode_overlay.ppm 0.5"
+  echo "  ./multi_output_pose_decode20_probe yolov8s_pose.hef pose_test_640x640_rgb.raw 0.25 100 pose_decode_overlay.ppm 0.5 0.45 20"
 
 proc clampInt(v, lo, hi: int): int {.inline.} =
   if v < lo: lo elif v > hi: hi else: v
@@ -126,6 +126,56 @@ proc decodeCandidate(group: PoseHeadGroup; scaleIndex, cellY, cellX: int): PoseC
       y: clampFloat(stride * (rawY * 2'f32 - 0.5'f32) + cy, 0'f32, float32(ModelHeight - 1)),
       score: sigmoid(rawScore)
     )
+
+proc bboxArea(c: PoseCandidate): float32 {.inline.} =
+  let w = max(0'f32, c.x2 - c.x1)
+  let h = max(0'f32, c.y2 - c.y1)
+  result = w * h
+
+proc bboxIou(a, b: PoseCandidate): float32 =
+  let ix1 = max(a.x1, b.x1)
+  let iy1 = max(a.y1, b.y1)
+  let ix2 = min(a.x2, b.x2)
+  let iy2 = min(a.y2, b.y2)
+  let iw = max(0'f32, ix2 - ix1)
+  let ih = max(0'f32, iy2 - iy1)
+  let inter = iw * ih
+  if inter <= 0'f32:
+    return 0'f32
+
+  let unionArea = bboxArea(a) + bboxArea(b) - inter
+  if unionArea <= 0'f32:
+    result = 0'f32
+  else:
+    result = inter / unionArea
+
+proc nmsPoseCandidates(
+    candidates: openArray[PoseCandidate];
+    iouThreshold: float32;
+    maxPoses: int
+): seq[PoseCandidate] =
+  if candidates.len == 0:
+    return @[]
+
+  var sorted = newSeq[PoseCandidate](candidates.len)
+  for i, c in candidates:
+    sorted[i] = c
+  sorted.sort(proc(a, b: PoseCandidate): int = cmp(b.score, a.score))
+
+  var suppressed = newSeq[bool](sorted.len)
+  for i in 0 ..< sorted.len:
+    if suppressed[i]:
+      continue
+
+    result.add(sorted[i])
+    if maxPoses > 0 and result.len >= maxPoses:
+      break
+
+    for j in (i + 1) ..< sorted.len:
+      if suppressed[j]:
+        continue
+      if bboxIou(sorted[i], sorted[j]) >= iouThreshold:
+        suppressed[j] = true
 
 proc drawPixel(rgb: var seq[byte]; x, y: int; r, g, b: byte) =
   if x < 0 or x >= ModelWidth or y < 0 or y >= ModelHeight:
@@ -248,9 +298,11 @@ proc main() =
   let hefPath = paramStr(1)
   let rawPath = paramStr(2)
   let scoreThreshold = if paramCount() >= 3: parseFloat(paramStr(3)).float32 else: 0.25'f32
-  let topN = if paramCount() >= 4: parseInt(paramStr(4)) else: 20
+  let candidateLimit = if paramCount() >= 4: parseInt(paramStr(4)) else: 100
   let overlayPath = if paramCount() >= 5: paramStr(5) else: ""
   let jointThreshold = if paramCount() >= 6: parseFloat(paramStr(6)).float32 else: 0.5'f32
+  let iouThreshold = if paramCount() >= 7: parseFloat(paramStr(7)).float32 else: 0.45'f32
+  let maxPoses = if paramCount() >= 8: parseInt(paramStr(8)) else: 20
 
   let input = readFile(rawPath)
   if input.len != ModelWidth * ModelHeight * 3:
@@ -286,8 +338,10 @@ proc main() =
   echo "Pose decode20 probe:"
   echo &"  groups         : {groups.len}"
   echo &"  scoreThreshold : {scoreThreshold:.5f}"
-  echo &"  topN           : {topN}"
+  echo &"  candidateLimit : {candidateLimit}"
   echo &"  jointThreshold : {jointThreshold:.5f}"
+  echo &"  iouThreshold   : {iouThreshold:.5f}"
+  echo &"  maxPoses       : {maxPoses}"
 
   var candidates: seq[PoseCandidate] = @[]
   for gi, g in groups:
@@ -314,12 +368,17 @@ proc main() =
       &"nonzero={nonzero} above={above} max={maxScore:.6f} maxCell=({maxX},{maxY})"
 
   candidates.sort(proc(a, b: PoseCandidate): int = cmp(b.score, a.score))
-  if candidates.len > topN:
-    candidates.setLen(topN)
+  let rawCandidateCount = candidates.len
+  if candidateLimit > 0 and candidates.len > candidateLimit:
+    candidates.setLen(candidateLimit)
 
-  echo &"  candidates     : {candidates.len}"
-  for i, c in candidates:
-    echo &"  cand[{i:02}] score={c.score:.6f} scale={c.scaleIndex} cell=({c.cellX},{c.cellY}) " &
+  let poses = nmsPoseCandidates(candidates, iouThreshold, maxPoses)
+
+  echo &"  raw candidates : {rawCandidateCount}"
+  echo &"  nms input      : {candidates.len}"
+  echo &"  poses          : {poses.len}"
+  for i, c in poses:
+    echo &"  pose[{i:02}] score={c.score:.6f} scale={c.scaleIndex} cell=({c.cellX},{c.cellY}) " &
       &"center=({c.centerX:.1f},{c.centerY:.1f}) " &
       &"bbox=({c.x1:.1f},{c.y1:.1f},{c.x2:.1f},{c.y2:.1f}) " &
       &"size=({c.x2 - c.x1:.1f}x{c.y2 - c.y1:.1f})"
@@ -330,7 +389,7 @@ proc main() =
 
   if overlayPath.len > 0:
     var rgb = cast[seq[byte]](input)
-    for i, c in candidates:
+    for i, c in poses:
       let r: byte = if i == 0: 255 else: 255
       let g: byte = if i == 0: 0 else: 160
       let b: byte = if i == 0: 0 else: 0
