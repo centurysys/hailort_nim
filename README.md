@@ -15,6 +15,7 @@ The current high-level API is focused on YOLO-style object detection models that
 - Optional inference profiling for the high-level `Detector`
 - Optional `threadtools`-based detector runner for streaming / pipeline-style applications
 - Worker-style submit / receive API with request correlation metadata
+- Pooled input submission using `threadtools` pool items for pipeline-style ownership transfer
 - Embedded / edge-device oriented design
 
 ## ⚠️ Important usage rule
@@ -252,6 +253,24 @@ For pipeline usage, prefer `submit()` with a moved `seq[byte]` when the input bu
 
 Use `submitCopy()` as a convenience API when the caller owns an `openArray[byte]` or wants to keep the original buffer.
 
+For streaming pipelines where input tensors are already managed by a `threadtools` pool, use `submitPooled()` / `submitPoolItem()`:
+
+```nim
+let pool = newPool[seq[byte]](requestQueueSize).get()
+
+# Fill the pool with input buffers elsewhere.
+var item = pool.acquire()
+
+discard worker.submitPooled(
+  move item,
+  requestId = frameId,
+  appScoreThreshold = 0.25'f32,
+  userData = cameraFrameKey
+)
+```
+
+The worker performs the HAILO input vstream write synchronously, then the pooled input item is returned to its original pool automatically when the request leaves the worker path. This is the preferred ownership-transfer API for codec / frame pipelines.
+
 ### Request correlation
 
 Worker requests and replies carry two correlation fields:
@@ -325,9 +344,18 @@ nim c -d:hailortThreadtools -d:release examples/threadtools_detector_worker_prob
 ./examples/threadtools_detector_worker_probe yolov11s.hef dog.raw 100 2 4 0.25
 ```
 
+### 🧵 Threadtools detector worker pooled-input probe
+
+```bash
+nim c -d:hailortThreadtools -d:release examples/threadtools_detector_worker_pooled_probe.nim
+./examples/threadtools_detector_worker_pooled_probe yolov11s.hef dog.raw 100 2 4 0.25
+```
+
+This probe pre-fills a `threadtools` pool with input tensors and submits pool items to the worker. It is closer to the intended codec pipeline ownership model than repeatedly copying borrowed input arrays.
+
 ## 📈 Throughput notes
 
-On TI AM67A (4x Cortex-A53 at 1.4 GHz) with HAILO-8L and a YOLOv11s HEF, the threadtools detector worker path reached about 39.5 fps with two in-flight slots:
+On TI AM67A (4x Cortex-A53 at 1.4 GHz) with HAILO-8L and a YOLOv11s HEF, both the normal worker path and the pooled-input worker path reached about 39.5 fps with two in-flight slots:
 
 ```text
 loops      : 100
@@ -387,7 +415,7 @@ The threadtools path is the preferred pipeline API. Async integration should be 
 
 Possible future directions:
 
-- PoolItem-based zero-copy input/output paths for codec pipelines
+- PoolItem-based output/result paths for codec pipelines
 - Async bridge built on top of the threadtools path
 - Pose estimation wrappers
 - Segmentation wrappers

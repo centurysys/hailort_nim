@@ -15,6 +15,7 @@ HAILO-8 / HAILO-8L デバイスで推論を実行するための低レベル API
 - `Detector` の推論経路 profiling
 - streaming / pipeline 型アプリ向けの optional `threadtools` 連携
 - request correlation metadata 付きの worker 型 submit / receive API
+- pipeline 型の所有権移動に向いた `threadtools` pool item 入力
 - 組み込み Linux / edge device 向けの設計
 
 ## ⚠️ 重要: open / close をフレームループ内で繰り返さない
@@ -252,6 +253,24 @@ pipeline では、入力 buffer の所有権を worker に渡せるなら、`seq
 
 caller が `openArray[byte]` を持っている場合や、元の buffer を保持したい場合の convenience API として `submitCopy()` を使えます。
 
+入力 tensor が `threadtools` pool で管理されている streaming pipeline では、`submitPooled()` / `submitPoolItem()` を使います。
+
+```nim
+let pool = newPool[seq[byte]](requestQueueSize).get()
+
+# input buffer は別の場所で pool に追加しておく
+var item = pool.acquire()
+
+discard worker.submitPooled(
+  move item,
+  requestId = frameId,
+  appScoreThreshold = 0.25'f32,
+  userData = cameraFrameKey
+)
+```
+
+worker は HAILO input vstream write を同期的に実行し、その後 request が worker 経路を抜けたところで pooled input item が元の pool へ自動返却されます。codec / frame pipeline では、この経路が入力 buffer の所有権移動 API として本命です。
+
 ### Request correlation
 
 Worker request / reply には、対応付け用の field があります。
@@ -325,9 +344,18 @@ nim c -d:hailortThreadtools -d:release examples/threadtools_detector_worker_prob
 ./examples/threadtools_detector_worker_probe yolov11s.hef dog.raw 100 2 4 0.25
 ```
 
+### 🧵 Threadtools detector worker pooled-input probe
+
+```bash
+nim c -d:hailortThreadtools -d:release examples/threadtools_detector_worker_pooled_probe.nim
+./examples/threadtools_detector_worker_pooled_probe yolov11s.hef dog.raw 100 2 4 0.25
+```
+
+この probe は、入力 tensor を `threadtools` pool に事前投入し、pool item を worker へ submit します。borrowed input array を毎回 copy する経路より、実際の codec pipeline で想定している所有権モデルに近い確認用です。
+
 ## 📈 スループットに関するメモ
 
-TI AM67A（Cortex-A53 1.4 GHz x 4 コア） + HAILO-8L + YOLOv11s HEF の計測では、threadtools detector worker 経路で、in-flight slot 2 個により約 39.5 fps に到達しています。
+TI AM67A（Cortex-A53 1.4 GHz x 4 コア） + HAILO-8L + YOLOv11s HEF の計測では、通常の worker 経路と pooled-input worker 経路のどちらも、in-flight slot 2 個により約 39.5 fps に到達しています。
 
 ```text
 loops      : 100
@@ -385,7 +413,7 @@ pipeline 用 API としては threadtools 経路を優先します。async 連�
 
 ## 🛣️ 今後の候補
 
-- codec pipeline 向けの PoolItem ベース zero-copy input/output path
+- codec pipeline 向けの PoolItem ベース output/result path
 - threadtools 経路の上に載せる async bridge
 - pose estimation wrapper
 - segmentation wrapper
