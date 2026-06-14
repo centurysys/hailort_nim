@@ -8,7 +8,7 @@
 
 既存の `ThreadtoolsDetectorWorker` は YOLO / NMS-by-class 向けです。
 
-一方、`ThreadtoolsInferenceWorker` は、モデル固有の postprocess をあとから選べる generic worker です。
+一方、`ThreadtoolsInferenceWorker` は、モデル固有の postprocess をあとから選べる generic worker です。これは single-output HEF 向けです。YOLOv8 pose のように複数 output vstream を持つ HEF では `ThreadtoolsMultiOutputInferenceWorker` を使います。
 
 ```text
 ThreadtoolsVStreamRunner
@@ -18,10 +18,13 @@ ThreadtoolsDetectorWorker
   YOLO / HAILO_NMS_BY_CLASS 専用 worker
 
 ThreadtoolsInferenceWorker
-  raw tensor / text detection / custom parser 向け generic worker
+  raw tensor / text detection / custom single-output parser 向け generic worker
+
+ThreadtoolsMultiOutputInferenceWorker
+  YOLOv8 pose のような multi-output parser 向け generic worker
 ```
 
-YOLO の通常利用では、既存の `ThreadtoolsDetectorWorker` を使うのが簡単です。独自モデル、分類、segmentation、OCR/text detection のようなモデルでは、まず `ThreadtoolsInferenceWorker` + raw tensor parser で出力を確認してから、モデル固有 parser を足すのが安全です。
+single-output YOLO の通常利用では、既存の `ThreadtoolsDetectorWorker` を使うのが簡単です。独自 single-output model、分類、OCR/text detection のようなモデルでは、まず `ThreadtoolsInferenceWorker` + raw tensor parser で出力を確認してから、モデル固有 parser を足すのが安全です。multi-output model では、まず `MultiOutputInference` で出力を確認し、parser ができた段階で `ThreadtoolsMultiOutputInferenceWorker` を使います。YOLOv8 pose path については `threadtools_multi_output_inference_worker.ja.md` を参照してください。
 
 ## 2. 基本ルール
 
