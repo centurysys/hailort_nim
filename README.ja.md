@@ -16,6 +16,8 @@ HAILO-8 / HAILO-8L デバイスで推論を実行するための低レベル API
 - streaming / pipeline 型アプリ向けの optional `threadtools` 連携
 - request correlation metadata 付きの worker 型 submit / receive API
 - pipeline 型の所有権移動に向いた `threadtools` pool item 入力
+- raw tensor / 独自モデル出力向けの generic `ThreadtoolsInferenceWorker`
+- UINT8 score map 出力向けの簡易 text detection parser
 - 組み込み Linux / edge device 向けの設計
 
 ## ⚠️ 重要: open / close をフレームループ内で繰り返さない
@@ -314,6 +316,56 @@ discard worker.join()
 
 `stop()` は graceful です。投入済み request は drain されてから worker が終了します。stop 開始後の新規 submit は拒否されます。
 
+
+## 🧩 Generic inference / raw output support
+
+HAILO NMS-by-class ではない出力を持つモデルでは、`ThreadtoolsInferenceWorker` を使います。
+
+この worker は、独自モデル、text detection、OCR、classification、segmentation など、出力 tensor に対してアプリ側・CPU 側の postprocess が必要な HEF 向けです。まず raw tensor parser で output metadata と byte buffer を確認し、その後にモデル固有 parser を追加する流れを想定しています。
+
+```text
+ThreadtoolsDetectorWorker:
+  YOLO / HAILO_NMS_BY_CLASS の parse 済み detection
+
+ThreadtoolsInferenceWorker:
+  raw tensor / text detection / custom parser result
+```
+
+raw tensor 経路では、出力 payload を owned buffer として reply queue で返します。vstream name、network name、shape、format などの静的 metadata は、各 reply に埋め込まず、worker owner 側から参照します。
+
+```nim
+let parserConfig = initRawTensorParserConfig(maxRawBytes = 0)
+let worker = openThreadtoolsInferenceWorker(
+  hefPath = "custom_model.hef",
+  parserConfig = parserConfig,
+  slotCount = 2,
+  requestQueueSize = 4
+).get()
+
+let outputMeta = worker.outputMetadata()
+echo outputMeta.name
+```
+
+raw output の調査手順、独自 parser の追加方針、thread 間 reply の所有権ルールは `docs/threadtools_inference_worker.ja.md` にまとめています。
+
+## 🔤 Text detection parser
+
+`hailort_nim` には、`paddle_ocr_v5_mobile_detection` のようなモデル向けに、初期版の CPU 側 text detection parser も追加しています。
+
+このモデルは、たとえば `544 x 960 x 1` の full-resolution `UINT8` score map を返します。parser は score map を threshold し、connected components、small region filter、bbox padding を行い、`TextRegionResult` を返します。
+
+アプリ側で YOLO 風の `score + bbox` として扱いたい場合は、既存の `Detection` 型へ変換できます。
+
+```text
+HAILO output score map
+  ↓ CPU parser
+TextRegionResult
+  ↓ optional conversion
+classId = text の seq[Detection]
+```
+
+この parser は、現時点では完全な DBPostProcess ではなく、出力の意味、座標、crop 領域を確認するための簡易実装です。OCR recognizer 連携へ進む前の足場として使います。
+
 ## 🧪 Examples
 
 ### ▶️ 同期推論
@@ -352,6 +404,29 @@ nim c -d:hailortThreadtools -d:release examples/threadtools_detector_worker_pool
 ```
 
 この probe は、入力 tensor を `threadtools` pool に事前投入し、pool item を worker へ submit します。borrowed input array を毎回 copy する経路より、実際の codec pipeline で想定している所有権モデルに近い確認用です。
+
+
+### 🧩 Threadtools raw tensor probe
+
+```bash
+nim c -d:hailortThreadtools -d:release examples/threadtools_inference_worker_raw_probe.nim
+./examples/threadtools_inference_worker_raw_probe custom_model.hef input.raw 10 2 4 0 64 custom_output.raw
+```
+
+最後の引数を指定すると、最後に受け取った raw output payload をファイルへ保存できます。
+
+### 🔤 Threadtools text detection probe
+
+```bash
+nim c -d:hailortThreadtools -d:release examples/threadtools_text_detection_probe.nim
+./examples/threadtools_text_detection_probe paddle_ocr_v5_mobile_detection.hef test_detection_960x544_rgb.raw 10 2 4 128 500 8 4 overlay.ppm 6 8 0
+```
+
+overlay を PNG に変換する例:
+
+```bash
+ffmpeg -y -i overlay.ppm overlay.png
+```
 
 ## 📈 スループットに関するメモ
 
@@ -401,7 +476,10 @@ ThreadtoolsDetector:
   threadtools vstream runner + YOLO NMS-by-class parse
 
 ThreadtoolsDetectorWorker:
-  application pipeline 向け request/reply queue API
+  YOLO application pipeline 向け request/reply queue API
+
+ThreadtoolsInferenceWorker:
+  raw tensor / custom parser pipeline 向け request/reply queue API
 
 Application:
   video decode, preprocessing, rendering, encoding, frame drop policy
@@ -413,6 +491,8 @@ pipeline 用 API としては threadtools 経路を優先します。async 連�
 
 ## 🛣️ 今後の候補
 
+- text detection connected-components parser の最適化
+- OCR recognizer 向け crop / resize helper
 - codec pipeline 向けの PoolItem ベース output/result path
 - threadtools 経路の上に載せる async bridge
 - pose estimation wrapper

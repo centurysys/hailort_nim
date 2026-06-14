@@ -30,37 +30,83 @@ proc readFileBytes(path: string): seq[byte] =
   if s.len > 0:
     copyMem(addr result[0], unsafeAddr s[0], s.len)
 
-proc previewBytes(bytes: var RawTensorBytes; maxCount: int): string =
-  let n = min(bytes.len, max(0, maxCount))
-  var parts: seq[string] = @[]
-  for i in 0 ..< n:
-    parts.add(toHex(int(bytes.byteAt(i)), 2))
+proc writePpmRgb(path: string; width, height: int; rgb: openArray[byte]) =
+  let expected = width * height * 3
+  if rgb.len != expected:
+    quit(&"overlay input size mismatch: expected={expected} actual={rgb.len}", QuitFailure)
 
-  result = parts.join(" ")
+  var f = open(path, fmWrite)
+  defer: f.close()
+  f.write(&"P6\n{width} {height}\n255\n")
+  if rgb.len > 0:
+    discard f.writeBuffer(unsafeAddr rgb[0], rgb.len)
 
-proc writeRawTensorBytes(path: string; bytes: var RawTensorBytes) =
-  ## Write RawTensorBytes to a file for visualization/debugging.
-  ##
-  ## This is intentionally a probe-local helper. It copies the explicit raw
-  ## buffer into a Nim string and writes it as binary data so callers can inspect
-  ## score maps with tools such as ffmpeg.
-  var s = newString(bytes.len)
-  if bytes.len > 0:
-    if bytes.data.isNil:
-      quit("raw tensor bytes are nil", QuitFailure)
-    copyMem(addr s[0], bytes.data, bytes.len)
+proc setPixelRgb(
+  img: var seq[byte];
+  width, height: int;
+  x, y: int;
+  r, g, b: byte
+) {.inline.} =
+  if x < 0 or x >= width or y < 0 or y >= height:
+    return
 
-  writeFile(path, s)
+  let off = (y * width + x) * 3
+  img[off + 0] = r
+  img[off + 1] = g
+  img[off + 2] = b
+
+proc drawRectRgb(
+  img: var seq[byte];
+  width, height: int;
+  region: TextRegion;
+  thickness = 2
+) =
+  var x0 = int(region.bbox.x)
+  var y0 = int(region.bbox.y)
+  var x1 = int(region.bbox.x + region.bbox.width) - 1
+  var y1 = int(region.bbox.y + region.bbox.height) - 1
+
+  x0 = max(0, min(width - 1, x0))
+  y0 = max(0, min(height - 1, y0))
+  x1 = max(0, min(width - 1, x1))
+  y1 = max(0, min(height - 1, y1))
+
+  if x1 < x0 or y1 < y0:
+    return
+
+  let t = max(1, thickness)
+  for k in 0 ..< t:
+    for x in x0 .. x1:
+      setPixelRgb(img, width, height, x, y0 + k, 255'u8, 0'u8, 0'u8)
+      setPixelRgb(img, width, height, x, y1 - k, 255'u8, 0'u8, 0'u8)
+    for y in y0 .. y1:
+      setPixelRgb(img, width, height, x0 + k, y, 255'u8, 0'u8, 0'u8)
+      setPixelRgb(img, width, height, x1 - k, y, 255'u8, 0'u8, 0'u8)
+
+proc writeOverlayPpm(
+  path: string;
+  width, height: int;
+  inputRgb: openArray[byte];
+  regions: openArray[TextRegion]
+) =
+  var overlay = newSeq[byte](inputRgb.len)
+  if inputRgb.len > 0:
+    copyMem(addr overlay[0], unsafeAddr inputRgb[0], inputRgb.len)
+
+  for region in regions:
+    overlay.drawRectRgb(width, height, region, thickness = 2)
+
+  writePpmRgb(path, width, height, overlay)
 
 proc usage() =
-  echo "Usage: threadtools_inference_worker_raw_probe <hef> <raw-input> [loops] [slots] [queue] [max-raw-bytes] [preview-bytes] [dump-raw-output]"
+  echo "Usage: threadtools_text_detection_probe <hef> <rgb-raw-input> [loops] [slots] [queue] [threshold] [min-area] [min-width] [min-height] [overlay-ppm] [pad-x] [pad-y] [max-regions]"
   echo ""
-  echo "This probe runs ThreadtoolsInferenceWorker with RawTensorParser."
-  echo "The output tensor is copied into RawTensorResult so it remains valid after"
-  echo "the vstream slot is released."
+  echo "This probe runs ThreadtoolsInferenceWorker with the simple TextDetection parser."
+  echo "It expects RGB24 raw input matching the model input size.  If overlay-ppm is"
+  echo "given, detected YOLO-like text bboxes are drawn on the input image and written as a PPM file."
   echo ""
   echo "Example:"
-  echo "  threadtools_inference_worker_raw_probe paddle_ocr_v5_mobile_detection.hef input.raw 10 2 4 0 64 output_score.raw"
+  echo "  threadtools_text_detection_probe paddle_ocr_v5_mobile_detection.hef test_detection_960x544_rgb.raw 10 2 4 128 500 8 4 overlay.ppm 6 8 0"
 
 # ------------------------------------------------------------------------------
 # main
@@ -88,21 +134,46 @@ proc main() =
       parseInt(paramStr(5))
     else:
       recommendedThreadtoolsInferenceWorkerRequestQueueSize(slots)
-  let maxRawBytes =
+  let threshold =
     if paramCount() >= 6:
       parseInt(paramStr(6))
     else:
-      0
-  let previewCount =
+      128
+  let minArea =
     if paramCount() >= 7:
       parseInt(paramStr(7))
     else:
-      64
-  let dumpRawPath =
+      100
+  let minWidth =
     if paramCount() >= 8:
-      paramStr(8)
+      parseInt(paramStr(8))
+    else:
+      8
+  let minHeight =
+    if paramCount() >= 9:
+      parseInt(paramStr(9))
+    else:
+      4
+  let overlayPath =
+    if paramCount() >= 10:
+      paramStr(10)
     else:
       ""
+  let padX =
+    if paramCount() >= 11:
+      parseInt(paramStr(11))
+    else:
+      6
+  let padY =
+    if paramCount() >= 12:
+      parseInt(paramStr(12))
+    else:
+      8
+  let maxRegions =
+    if paramCount() >= 13:
+      parseInt(paramStr(13))
+    else:
+      0
 
   if loops <= 0:
     quit("loops must be positive", QuitFailure)
@@ -110,16 +181,10 @@ proc main() =
     quit("slots must be positive", QuitFailure)
   if queueSize <= 0:
     quit("queue size must be positive", QuitFailure)
-  if maxRawBytes < 0:
-    quit("max-raw-bytes must be >= 0", QuitFailure)
-  if previewCount < 0:
-    quit("preview-bytes must be >= 0", QuitFailure)
-
-  if queueSize <= slots:
-    echo &"note: queue={queueSize} <= slots={slots}; this benchmark may underfill HAILO. Use queue >= {slots * 2}."
 
   let inputTemplate = readFileBytes(rawPath)
   let det = getOrQuit(Detector.open(hefPath), "Detector.open")
+  let inputMeta = getOrQuit(det.inputMetadata(), "Detector.inputMetadata")
 
   if inputTemplate.len != det.inputSize():
     quit(
@@ -127,7 +192,23 @@ proc main() =
       QuitFailure
     )
 
-  let parserConfig = initRawTensorParserConfig(maxRawTensorBytes = maxRawBytes)
+  if overlayPath.len > 0:
+    if inputMeta.shape.channels != 3:
+      quit(
+        &"overlay output requires RGB input with 3 channels: got {inputMeta.shape.channels}",
+        QuitFailure
+      )
+
+  let parserConfig = initTextDetectionDbParserConfig(
+    scoreThreshold = threshold,
+    minArea = minArea,
+    minWidth = minWidth,
+    minHeight = minHeight,
+    padX = padX,
+    padY = padY,
+    maxRegions = maxRegions,
+    sortBy = trsTopLeft
+  )
   let worker = getOrQuit(
     det.startThreadtoolsInferenceWorker(parserConfig, slots, queueSize),
     "startThreadtoolsInferenceWorker"
@@ -138,11 +219,13 @@ proc main() =
   echo &"hef={hefPath}"
   echo &"raw={rawPath}"
   echo &"input_size={worker.inputSize()} output_size={worker.outputSize()}"
-  echo &"loops={loops} slots={slots} queue={queueSize} max_raw_bytes={maxRawBytes}"
-  if dumpRawPath.len > 0:
-    echo &"dump_raw_output={dumpRawPath}"
-  echo "parser=raw_tensor"
+  echo &"loops={loops} slots={slots} queue={queueSize}"
+  echo &"parser=text_detection threshold={threshold} minArea={minArea} minWidth={minWidth} minHeight={minHeight} padX={padX} padY={padY} maxRegions={maxRegions}"
+  if overlayPath.len > 0:
+    echo &"overlay={overlayPath}"
   echo ""
+  echo "Input metadata:"
+  echo &"  shape       : {inputMeta.shape.height} x {inputMeta.shape.width} x {inputMeta.shape.channels}"
   echo "Output metadata:"
   echo &"  name        : {outputMeta.name}"
   echo &"  network     : {outputMeta.networkName}"
@@ -162,11 +245,9 @@ proc main() =
   var maxWaitUs: int64 = 0
   var lastRequestId: uint64 = 0'u64
   var lastUserData: uint64 = 0'u64
-  var lastOutputName = ""
-  var lastOutputSize = 0
-  var lastPreview = ""
+  var lastRegions: seq[TextRegion] = @[]
 
-  const userDataBase = 30_000'u64
+  const userDataBase = 40_000'u64
 
   let started = getMonoTime()
 
@@ -198,12 +279,7 @@ proc main() =
           &"worker request {reply.requestId} returned unexpected userData: expected={expectedUserData} actual={reply.userData}",
           QuitFailure
         )
-      if reply.result.userData != reply.userData:
-        quit(
-          &"worker request {reply.requestId} result userData mismatch: reply={reply.userData} result={reply.result.userData}",
-          QuitFailure
-        )
-      if reply.result.inference.kind != hrkRawTensor:
+      if reply.result.inference.kind != hrkTextRegions:
         quit(
           &"worker request {reply.requestId} returned unexpected kind: {reply.result.inference.kind}",
           QuitFailure
@@ -217,16 +293,9 @@ proc main() =
       totalReadUs += timing.readUs
       totalParseUs += timing.parseUs
 
-      if reply.result.inference.raw.outputName.len > 0:
-        lastOutputName = reply.result.inference.raw.outputName
-      else:
-        lastOutputName = outputMeta.name
-      lastOutputSize = reply.result.inference.raw.outputSize
-      lastPreview = previewBytes(reply.result.inference.raw.bytes, previewCount)
-
-      if dumpRawPath.len > 0 and completed == loops - 1:
-        writeRawTensorBytes(dumpRawPath, reply.result.inference.raw.bytes)
-
+      lastRegions.setLen(0)
+      for region in reply.result.inference.textRegions.regions:
+        lastRegions.add(region)
       reply.clear()
 
       if waitUs < minWaitUs:
@@ -250,6 +319,7 @@ proc main() =
   let elapsedUs = inMicroseconds(getMonoTime() - started)
   quitIfErr(worker.stop(), "worker.stop")
   quitIfErr(worker.join(), "worker.join")
+
   let elapsedMs = float(elapsedUs) / 1000.0
   let fps =
     if elapsedUs > 0:
@@ -258,7 +328,7 @@ proc main() =
       0.0
 
   echo ""
-  echo "Threadtools inference worker raw summary:"
+  echo "Threadtools text detection summary:"
   echo &"  elapsed    : {elapsedMs:.3f} ms"
   echo &"  fps        : {fps:.2f}"
   echo &"  avg write  : {float(totalWriteUs) / float(loops) / 1000.0:.3f} ms"
@@ -268,11 +338,24 @@ proc main() =
   echo &"  wait max   : {float(maxWaitUs) / 1000.0:.3f} ms"
   echo &"  last req   : {lastRequestId}"
   echo &"  last data  : {lastUserData}"
-  echo &"  raw name   : {lastOutputName}"
-  echo &"  raw size   : {lastOutputSize}"
-  echo &"  raw preview: {lastPreview}"
-  if dumpRawPath.len > 0:
-    echo &"  raw dump   : {dumpRawPath}"
+  echo &"  regions    : {lastRegions.len}"
+
+  let yoloDetections = lastRegions.toDetections(inputMeta.shape.width, inputMeta.shape.height, classId = 0)
+  echo &"  yolo_like  : {yoloDetections.len}"
+
+  for i, r in lastRegions:
+    let d = yoloDetections[i]
+    echo &"  region[{i:02}] score={r.score:.3f} area={r.area} bbox=({r.bbox.x:.1f},{r.bbox.y:.1f},{r.bbox.width:.1f},{r.bbox.height:.1f}) norm=({d.xMin:.4f},{d.yMin:.4f},{d.xMax:.4f},{d.yMax:.4f})"
+
+  if overlayPath.len > 0:
+    writeOverlayPpm(
+      overlayPath,
+      inputMeta.shape.width,
+      inputMeta.shape.height,
+      inputTemplate,
+      lastRegions
+    )
+    echo &"  overlay    : {overlayPath}"
 
   debugTeardown("teardown: before worker.close")
   if not worker.isClosed():

@@ -63,12 +63,15 @@ type
   TextRegion* = object
     ## One detected text region.
     ##
-    ## points normally carries a 4-point polygon in clockwise order, while bbox
-    ## is the corresponding axis-aligned rectangle.  The coordinate restore step
-    ## remains an application/codecpipe responsibility because it needs original
-    ## image size and preprocessing metadata.
+    ## points carries a 4-point polygon in clockwise order, while bbox is the
+    ## corresponding axis-aligned rectangle.  Keep points as a fixed array so
+    ## text-region replies moved through ThreadQueue do not contain nested seqs.
+    ## The coordinate restore step remains an application/codecpipe
+    ## responsibility because it needs original image size and preprocessing
+    ## metadata.
     score*: float32
-    points*: seq[PointF32]
+    area*: int
+    points*: array[4, PointF32]
     bbox*: RectF32
 
   TextRegionResult* = object
@@ -317,3 +320,39 @@ proc byteAt*(b: var RawTensorBytes; index: int): byte =
 
   let p = cast[ptr UncheckedArray[byte]](b.data)
   result = p[index]
+
+# ==============================================================================
+# Text region compatibility helpers
+# ==============================================================================
+
+proc toDetection*(
+  region: TextRegion;
+  imageWidth: int;
+  imageHeight: int;
+  classId = 0
+): Detection =
+  ## Convert one TextRegion into the existing normalized Detection shape.
+  ##
+  ## Text detection is class-agnostic, so classId defaults to 0.  The returned
+  ## box uses the same normalized xMin/yMin/xMax/yMax convention as YOLO/NMS
+  ## detections in hailort_nim/models/detection.nim.
+  let w = max(1, imageWidth)
+  let h = max(1, imageHeight)
+  result.classId = classId
+  result.score = region.score
+  result.xMin = region.bbox.x / float32(w)
+  result.yMin = region.bbox.y / float32(h)
+  result.xMax = (region.bbox.x + region.bbox.width) / float32(w)
+  result.yMax = (region.bbox.y + region.bbox.height) / float32(h)
+  result = result.clamped()
+
+proc toDetections*(
+  regions: openArray[TextRegion];
+  imageWidth: int;
+  imageHeight: int;
+  classId = 0
+): seq[Detection] =
+  ## Convert text regions into YOLO-like normalized Detection records.
+  result = newSeqOfCap[Detection](regions.len)
+  for region in regions:
+    result.add(region.toDetection(imageWidth, imageHeight, classId))

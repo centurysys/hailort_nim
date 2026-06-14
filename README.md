@@ -16,6 +16,8 @@ The current high-level API is focused on YOLO-style object detection models that
 - Optional `threadtools`-based detector runner for streaming / pipeline-style applications
 - Worker-style submit / receive API with request correlation metadata
 - Pooled input submission using `threadtools` pool items for pipeline-style ownership transfer
+- Generic `ThreadtoolsInferenceWorker` for raw tensor / custom model outputs
+- Simple text detection parser for UINT8 score-map outputs
 - Embedded / edge-device oriented design
 
 ## ⚠️ Important usage rule
@@ -314,6 +316,56 @@ discard worker.join()
 
 `stop()` is graceful: already-submitted requests are drained before the worker exits. New submissions are rejected after stopping begins.
 
+
+## 🧩 Generic inference / raw output support
+
+For models that do not produce HAILO NMS-by-class output, use `ThreadtoolsInferenceWorker`.
+
+This worker is intended for custom models, text detection, OCR, classification, segmentation, or any HEF whose output needs application-specific CPU post-processing.  Start with the raw tensor parser, inspect the output metadata and byte buffer, then add a parser for the model-specific output format.
+
+```text
+ThreadtoolsDetectorWorker:
+  YOLO / HAILO_NMS_BY_CLASS parsed detections
+
+ThreadtoolsInferenceWorker:
+  raw tensor / text detection / custom parser result
+```
+
+The raw tensor path returns an owned output payload through the reply queue. Static output metadata such as vstream name, network name, shape, and format should be read from the worker owner side instead of being embedded in each cross-thread reply.
+
+```nim
+let parserConfig = initRawTensorParserConfig(maxRawBytes = 0)
+let worker = openThreadtoolsInferenceWorker(
+  hefPath = "custom_model.hef",
+  parserConfig = parserConfig,
+  slotCount = 2,
+  requestQueueSize = 4
+).get()
+
+let outputMeta = worker.outputMetadata()
+echo outputMeta.name
+```
+
+See `docs/threadtools_inference_worker.md` for details on raw output inspection, custom parser flow, and thread-safe reply ownership rules.
+
+## 🔤 Text detection parser
+
+`hailort_nim` also includes an initial CPU-side text detection parser for models such as `paddle_ocr_v5_mobile_detection`.
+
+That model returns a full-resolution `UINT8` score map, for example `544 x 960 x 1`. The parser thresholds the score map, runs connected components, filters small regions, pads bboxes, and returns a `TextRegionResult`.
+
+The result can also be converted to the existing YOLO-like `Detection` representation when the application wants `score + bbox` results.
+
+```text
+HAILO output score map
+  ↓ CPU parser
+TextRegionResult
+  ↓ optional conversion
+seq[Detection] with classId = text
+```
+
+This parser is intentionally simple and is not a full DBPostProcess implementation yet. It is useful for validating output semantics, coordinates, and crop regions before adding OCR recognizer integration.
+
 ## 🧪 Examples
 
 ### ▶️ Synchronous inference
@@ -352,6 +404,29 @@ nim c -d:hailortThreadtools -d:release examples/threadtools_detector_worker_pool
 ```
 
 This probe pre-fills a `threadtools` pool with input tensors and submits pool items to the worker. It is closer to the intended codec pipeline ownership model than repeatedly copying borrowed input arrays.
+
+
+### 🧩 Threadtools raw tensor probe
+
+```bash
+nim c -d:hailortThreadtools -d:release examples/threadtools_inference_worker_raw_probe.nim
+./examples/threadtools_inference_worker_raw_probe custom_model.hef input.raw 10 2 4 0 64 custom_output.raw
+```
+
+The optional last argument writes the last raw output payload to a file for offline inspection.
+
+### 🔤 Threadtools text detection probe
+
+```bash
+nim c -d:hailortThreadtools -d:release examples/threadtools_text_detection_probe.nim
+./examples/threadtools_text_detection_probe paddle_ocr_v5_mobile_detection.hef test_detection_960x544_rgb.raw 10 2 4 128 500 8 4 overlay.ppm 6 8 0
+```
+
+Convert the overlay to PNG if needed:
+
+```bash
+ffmpeg -y -i overlay.ppm overlay.png
+```
 
 ## 📈 Throughput notes
 
@@ -401,7 +476,10 @@ ThreadtoolsDetector:
   threadtools vstream runner + YOLO NMS-by-class parsing
 
 ThreadtoolsDetectorWorker:
-  request/reply queue API for application pipelines
+  request/reply queue API for YOLO application pipelines
+
+ThreadtoolsInferenceWorker:
+  request/reply queue API for raw tensor / custom parser pipelines
 
 Application:
   video decode, preprocessing, rendering, encoding, frame dropping policy
@@ -415,6 +493,8 @@ The threadtools path is the preferred pipeline API. Async integration should be 
 
 Possible future directions:
 
+- Optimized text detection connected-components parser
+- OCR recognizer crop / resize helpers
 - PoolItem-based output/result paths for codec pipelines
 - Async bridge built on top of the threadtools path
 - Pose estimation wrappers

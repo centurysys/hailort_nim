@@ -2,6 +2,7 @@ import std/[monotimes, strformat, times]
 
 import ./detector
 import ./inference_result
+import ./text_detection_parser
 import ../lowlevel
 import ../models/detection
 
@@ -13,9 +14,9 @@ type
   HailoOutputParserKind* = enum
     ## Parser kind for converting a HAILO output buffer into HailoInferenceResult.
     ##
-    ## Only hopRawTensor and hopNmsByClass are implemented in this step.  The
-    ## remaining values are reserved so worker/app code can name the intended
-    ## future parser without forcing another public enum reshuffle.
+    ## hopRawTensor, hopNmsByClass, and hopTextDetectionDb are implemented.
+    ## The remaining values are reserved so worker/app code can name the
+    ## intended future parser without forcing another public enum reshuffle.
     hopRawTensor
     hopNmsByClass
     hopClassificationTopK
@@ -35,6 +36,7 @@ type
     maxBboxesPerClass*: int
     appScoreThreshold*: float32
     sortDetections*: bool
+    textDetection*: TextDetectionParserConfig
 
 # ==============================================================================
 # Small helpers
@@ -59,9 +61,9 @@ proc effectiveOutputName(
 
 proc implemented*(kind: HailoOutputParserKind): bool =
   result = case kind
-    of hopRawTensor, hopNmsByClass:
+    of hopRawTensor, hopNmsByClass, hopTextDetectionDb:
       true
-    of hopClassificationTopK, hopTextDetectionDb, hopTextRecognition:
+    of hopClassificationTopK, hopTextRecognition:
       false
 
 proc validateParserConfig*(config: HailoOutputParserConfig): HE[void] =
@@ -92,7 +94,12 @@ proc validateParserConfig*(config: HailoOutputParserConfig): HE[void] =
         &"maxBboxesPerClass must be positive: {config.maxBboxesPerClass}"
       ).err
 
-  of hopClassificationTopK, hopTextDetectionDb, hopTextRecognition:
+  of hopTextDetectionDb:
+    let textRes = config.textDetection.validate()
+    if textRes.isErr:
+      return textRes.error.err
+
+  of hopClassificationTopK, hopTextRecognition:
     discard
 
   result = okVoid()
@@ -116,7 +123,8 @@ proc initRawTensorParserConfig*(
     numberOfClasses: 0,
     maxBboxesPerClass: 0,
     appScoreThreshold: 0.0'f32,
-    sortDetections: false
+    sortDetections: false,
+    textDetection: defaultTextDetectionParserConfig()
   )
 
 proc defaultRawTensorParserConfig*(): HailoOutputParserConfig =
@@ -137,7 +145,8 @@ proc initNmsByClassParserConfig*(
     numberOfClasses: numberOfClasses,
     maxBboxesPerClass: maxBboxesPerClass,
     appScoreThreshold: appScoreThreshold,
-    sortDetections: sortDetections
+    sortDetections: sortDetections,
+    textDetection: defaultTextDetectionParserConfig()
   )
 
 proc initNmsByClassParserConfig*(
@@ -164,6 +173,51 @@ proc initNmsByClassParserConfig*(
     sortDetections = sortDetections,
     outputNameOverride = outputNameOverride
   ).ok
+
+# ==============================================================================
+# Text detection parser config
+# ==============================================================================
+
+proc initTextDetectionDbParserConfig*(
+  scoreThreshold = 128;
+  minScore = 0.0'f32;
+  minArea = 100;
+  minWidth = 8;
+  minHeight = 4;
+  padX = 0;
+  padY = 0;
+  maxRegions = 0;
+  eightConnected = true;
+  sortBy = trsTopLeft;
+  outputNameOverride = ""
+): HailoOutputParserConfig =
+  ## Create a parser config for UINT8 text score-map output.
+  ##
+  ## This first implementation uses threshold + connected components instead of
+  ## a full DBPostProcess clone.  It is intended for validating the HAILO8L
+  ## paddle_ocr_v5_mobile_detection output and returning YOLO-like text regions
+  ## with score + axis-aligned bbox + 4-point polygon.
+  result = HailoOutputParserConfig(
+    kind: hopTextDetectionDb,
+    outputNameOverride: outputNameOverride,
+    maxRawTensorBytes: 0,
+    numberOfClasses: 0,
+    maxBboxesPerClass: 0,
+    appScoreThreshold: 0.0'f32,
+    sortDetections: false,
+    textDetection: initTextDetectionParserConfig(
+      scoreThreshold = scoreThreshold,
+      minScore = minScore,
+      minArea = minArea,
+      minWidth = minWidth,
+      minHeight = minHeight,
+      padX = padX,
+      padY = padY,
+      maxRegions = maxRegions,
+      eightConnected = eightConnected,
+      sortBy = sortBy
+    )
+  )
 
 # ==============================================================================
 # Raw tensor parser
@@ -295,6 +349,50 @@ proc parseNmsByClassInto*(
   result = okVoid()
 
 # ==============================================================================
+# Text detection score-map parser
+# ==============================================================================
+
+proc parseTextDetectionDbInto*(
+  outputPtr: pointer;
+  outputSize: int;
+  outputMetadata: VStreamMetadata;
+  config: HailoOutputParserConfig;
+  dst: var HailoInferenceResult;
+  requestId = 0'u64;
+  userData = 0'u64;
+  timing = HailoInferenceTiming()
+): HE[void] =
+  ## Parse a UINT8 text score-map output into dst.textRegions.
+  if config.kind != hopTextDetectionDb:
+    return makeError(
+      HAILO_INVALID_ARGUMENT,
+      &"parser config kind is not hopTextDetectionDb: {config.kind}"
+    ).err
+
+  let validRes = config.validateParserConfig()
+  if validRes.isErr:
+    return validRes.error.err
+
+  let parseStart = getMonoTime()
+  dst.resetKind(hrkTextRegions)
+  dst.setCorrelation(requestId, userData)
+  dst.timing = timing
+
+  let parseRes = parseTextDetectionScoreMapInto(
+    outputPtr,
+    outputSize,
+    outputMetadata,
+    config.textDetection,
+    dst.textRegions
+  )
+  if parseRes.isErr:
+    dst.clear()
+    return parseRes.error.err
+
+  dst.timing.parseUs = elapsedUs(parseStart)
+  result = okVoid()
+
+# ==============================================================================
 # Generic parser entry points
 # ==============================================================================
 
@@ -343,7 +441,19 @@ proc parseOutputInto*(
       timing = timing
     )
 
-  of hopClassificationTopK, hopTextDetectionDb, hopTextRecognition:
+  of hopTextDetectionDb:
+    result = parseTextDetectionDbInto(
+      outputPtr,
+      outputSize,
+      outputMetadata,
+      config,
+      dst,
+      requestId = requestId,
+      userData = userData,
+      timing = timing
+    )
+
+  of hopClassificationTopK, hopTextRecognition:
     result = makeError(
       HAILO_NOT_SUPPORTED,
       &"parser kind is not implemented yet: {config.kind}"
