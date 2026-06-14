@@ -13,8 +13,9 @@ HAILO-8 / HAILO-8L デバイスで推論を実行するための低レベル API
 - open / activate / deactivate / close の明示的なライフサイクル管理
 - 複数 HEF の事前準備と高速なモデル切り替え
 - `Detector` の推論経路 profiling
-- スループット向上用の async-style vstream runner
-- YOLO / NMS-by-class 用の `AsyncDetector`
+- streaming / pipeline 型アプリ向けの optional `threadtools` 連携
+- request correlation metadata 付きの worker 型 submit / receive API
+- pipeline 型の所有権移動に向いた `threadtools` pool item 入力
 - 組み込み Linux / edge device 向けの設計
 
 ## ⚠️ 重要: open / close をフレームループ内で繰り返さない
@@ -157,120 +158,161 @@ detector.resetProfile()
 
 host 側処理、HailoRT 転送、デバイス実行待ちのどこで時間を使っているかを切り分けるのに使えます。
 
-## ⚡ Async vstream support
+## 🧵 Threadtools detector support
 
-`hailort_nim` には、スループット向上用の async-style vstream support があります。
+`hailort_nim` には、継続的に frame / tensor を HAILO へ流す worker 型 pipeline 向けに、optional の `threadtools` 連携があります。
 
-目的は以下を重ねることです。
+目的は、blocking な HailoRT vstream read を `asyncdispatch` 中心の API で無理に包まず、HAILO を埋め続けられる構成を作ることです。
 
-- input vstream write
-- blocking な output vstream read
-- アプリ側の後処理
+threadtools 経路は、以下の 3 段に分かれています。
 
-HailoRT の vstream `read()` は blocking です。`AsyncVStreamRunner` は、input write は caller thread で同期実行し、長く待つ output read を内部 read thread に逃がします。
+```text
+ThreadtoolsVStreamRunner:
+  model-agnostic な vstream write/read overlap
+  caller が input buffer を submit
+  内部 read worker が output vstream result を待つ
 
-これにより、raw stream async API に踏み込まずに、既存 vstream API の上でパイプライン化できます。
+ThreadtoolsDetector:
+  ThreadtoolsVStreamRunner + YOLO NMS-by-class parse
+  caller が input buffer を submit し、parse 済み detections を受け取る
 
-### 🧱 ビルド条件
+ThreadtoolsDetectorWorker:
+  request queue + reply queue + detector worker thread
+  application / codec pipeline から使うための API
+```
 
-Async vstream support は Nim の thread を使います。
+### ビルド条件
 
-使う場合は `--threads:on` が必要です。
+threadtools 経路は `-d:hailortThreadtools` で有効化します。
 
 ```bash
-nim c --threads:on -d:hailortAsyncVstream -d:release examples/async_vstream_runner_split_task_probe.nim
+nim c -d:hailortThreadtools -d:release examples/threadtools_detector_worker_probe.nim
 ```
 
-通常の同期 API は、async vstream の export を `-d:hailortAsyncVstream` で guard しておけば、`--threads:on` なしでも使える構成にできます。
+最近の Nim 2.x 環境では thread がデフォルト有効になっていることがあります。設定によって無効な場合は `--threads:on` を追加してください。
 
-top-level export の例:
+threadtools 経路を使うには、`threadtools` と `move_results` パッケージが Nimble または Nim の module search path から見えている必要があります。
 
-```nim
-when defined(hailortAsyncVstream):
-  import ./hailort_nim/highlevel/async_vstream_runner
-  import ./hailort_nim/highlevel/async_detector
-  export async_vstream_runner
-  export async_detector
-```
+### ThreadtoolsDetector
 
-### 🧵 AsyncVStreamRunner
-
-`AsyncVStreamRunner` は model-agnostic な部品です。vstream I/O の重ね合わせと output slot 管理だけを担当します。
+`ThreadtoolsDetector` は、submit / receive の順序を caller 側で制御しつつ、blocking な output read を内部 vstream read worker に逃がしたい場合に使います。
 
 ```nim
 let det = Detector.open("yolov11s.hef").get()
 defer:
   discard det.close()
 
-let runner = det.openAsyncVStreamRunner(slotCount = 2).get()
+let tdet = det.openThreadtoolsDetector(slotCount = 2, appScoreThreshold = 0.25'f32).get()
 defer:
-  discard runner.close()
+  discard tdet.close()
+
+discard tdet.submit(input)
+
+var detections: seq[Detection] = @[]
+let r = tdet.waitDetections(detections)
+if r.isErr:
+  quit($r.error)
 ```
 
-推奨する split-task API は以下です。
+この経路では parse 後に output slot を内部で release するため、caller が vstream output pointer の寿命を直接管理する必要はありません。
+
+### ThreadtoolsDetectorWorker
+
+`ThreadtoolsDetectorWorker` は、pipeline 型アプリ向けの推奨 API です。
+
+detector worker thread を持ち、queue 型 interface を提供します。
 
 ```nim
-let ready = await runner.waitWritable()
-if ready.isErr:
-  quit($ready.error)
+let worker = openThreadtoolsDetectorWorker(
+  "yolov11s.hef",
+  slotCount = 2,
+  requestQueueSize = recommendedThreadtoolsDetectorWorkerRequestQueueSize(2),
+  appScoreThreshold = 0.25'f32
+).get()
 
-let readFuture = runner.writeAsync(input).get()
+discard worker.submitCopy(
+  requestId = 0'u64,
+  input = input,
+  userData = 10000'u64
+)
 
-# readFuture は別の async task に渡せます。
+var reply: ThreadtoolsDetectorWorkerReply
+let rr = worker.waitReply(reply)
+if rr.isErr:
+  quit($rr.error)
 
-let result = (await readFuture).get()
+echo reply.requestId
+for det in reply.detections:
+  echo det
 
-try:
-  # result.outputPtr / result.outputSize を parse する
-  discard
-finally:
-  discard runner.releaseResult(result)
+discard worker.stop()
+discard worker.join()
 ```
 
-API を分けている理由:
+pipeline では、入力 buffer の所有権を worker に渡せるなら、`seq[byte]` を move して渡す `submit()` を優先します。
 
-- `waitWritable()` は async で、output slot の空きを await する。
-- `writeAsync()` は意図的に async proc ではない。
-- これにより、`openArray[byte]` を `await` 境界をまたいで capture しない。
-- input buffer は `inputVstream.write()` の同期呼び出し中に消費される。
+caller が `openArray[byte]` を持っている場合や、元の buffer を保持したい場合の convenience API として `submitCopy()` を使えます。
 
-### 📦 AsyncVStreamResult
-
-`AsyncVStreamResult` には以下が入ります。
+入力 tensor が `threadtools` pool で管理されている streaming pipeline では、`submitPooled()` / `submitPoolItem()` を使います。
 
 ```nim
-type
-  AsyncVStreamResult* = object
-    slotIndex*: int
-    outputPtr*: pointer
-    outputSize*: int
-    writeUs*: int64
-    readUs*: int64
+let pool = newPool[seq[byte]](requestQueueSize).get()
+
+# input buffer は別の場所で pool に追加しておく
+var item = pool.acquire()
+
+discard worker.submitPooled(
+  move item,
+  requestId = frameId,
+  appScoreThreshold = 0.25'f32,
+  userData = cameraFrameKey
+)
 ```
 
-output buffer は `AsyncVStreamRunner` が所有します。`releaseResult()` するまでは `outputPtr` を読めます。
+worker は HAILO input vstream write を同期的に実行し、その後 request が worker 経路を抜けたところで pooled input item が元の pool へ自動返却されます。codec / frame pipeline では、この経路が入力 buffer の所有権移動 API として本命です。
 
-使い終わったら必ず release してください。
+### Request correlation
 
-```nim
-discard runner.releaseResult(result)
-```
-
-release しないと output slot が戻らず、後続の推論が詰まります。
-
-### 🔎 AsyncDetector
-
-`AsyncDetector` は、`AsyncVStreamRunner` の上にある YOLO / NMS-by-class 用 wrapper です。
+Worker request / reply には、対応付け用の field があります。
 
 ```text
-AsyncVStreamRunner:
-  model-agnostic な vstream I/O overlap
+requestId:
+  連番またはアプリ定義の request identifier
 
-AsyncDetector:
-  AsyncVStreamRunner + YOLO NMS-by-class parse
+userData:
+  アプリ側 metadata 用の opaque uint64
 ```
 
-この分離により、将来の pose estimation、segmentation、classification、OCR、ナンバープレート認識などにも `AsyncVStreamRunner` を流用できます。
+これにより、結果を camera / frame / event / timestamp などと対応付けられます。受信順だけに依存する必要はありません。
+
+エラー応答にも同じ metadata が残るため、失敗した request の追跡にも使えます。
+
+### Queue depth
+
+`slotCount = 2` の場合、request queue size は最低 4 を推奨します。
+
+queue depth が slot count と同じだと、reply の合間に worker pipeline が空き、HAILO vstream 経路を埋め続けられないことがあります。
+
+以下を使うのが基本です。
+
+```nim
+let qsize = recommendedThreadtoolsDetectorWorkerRequestQueueSize(slotCount)
+```
+
+TI AM67A（Cortex-A53 1.4 GHz x 4 コア） + HAILO-8L + YOLOv11s の手元計測では、request queue を `slotCount * 2` より増やしても throughput は改善しませんでした。ただし、アプリ側で意図的に入力を多めに buffer したい場合には、より大きな queue depth を指定できます。
+
+### Shutdown
+
+worker は明示的な graceful shutdown を持ちます。
+
+```nim
+discard worker.stop()
+discard worker.join()
+```
+
+`close()` は stop + join の convenience wrapper です。
+
+`stop()` は graceful です。投入済み request は drain されてから worker が終了します。stop 開始後の新規 submit は拒否されます。
 
 ## 🧪 Examples
 
@@ -288,49 +330,61 @@ nim c -d:release examples/infer_high_profile.nim
 ./examples/infer_high_profile yolov11n.hef dog_640x640x3.raw 50 5
 ```
 
-### ⚡ Async vstream runner probe
+### 🧵 Threadtools detector probe
 
 ```bash
-nim c --threads:on -d:hailortAsyncVstream -d:release examples/async_vstream_runner_probe.nim
-./examples/async_vstream_runner_probe yolov11s.hef dog.raw 100 2
+nim c -d:hailortThreadtools -d:release examples/threadtools_detector_probe.nim
+./examples/threadtools_detector_probe yolov11s.hef dog.raw 100 2 0.25
 ```
 
-### 🔎 Async detector probe
+### 🧵 Threadtools detector worker probe
 
 ```bash
-nim c --threads:on -d:hailortAsyncVstream -d:release examples/async_detector_probe.nim
-./examples/async_detector_probe yolov11s.hef dog.raw 100 2 0.25
+nim c -d:hailortThreadtools -d:release examples/threadtools_detector_worker_probe.nim
+./examples/threadtools_detector_worker_probe yolov11s.hef dog.raw 100 2 4 0.25
 ```
 
-### 🧩 Split async task probe
-
-write task と read/result task を分けた、アプリに近い構成の example です。
+### 🧵 Threadtools detector worker pooled-input probe
 
 ```bash
-nim c --threads:on -d:hailortAsyncVstream -d:release examples/async_vstream_runner_split_task_probe.nim
-./examples/async_vstream_runner_split_task_probe yolov11s.hef dog.raw 100 2
+nim c -d:hailortThreadtools -d:release examples/threadtools_detector_worker_pooled_probe.nim
+./examples/threadtools_detector_worker_pooled_probe yolov11s.hef dog.raw 100 2 4 0.25
 ```
+
+この probe は、入力 tensor を `threadtools` pool に事前投入し、pool item を worker へ submit します。borrowed input array を毎回 copy する経路より、実際の codec pipeline で想定している所有権モデルに近い確認用です。
 
 ## 📈 スループットに関するメモ
 
-HAILO-8L と YOLOv11 系 HEF を使った手元の計測では、in-flight slot を 2 個にすることで、完全同期の write/read loop より大きくスループットが改善しました。
+TI AM67A（Cortex-A53 1.4 GHz x 4 コア） + HAILO-8L + YOLOv11s HEF の計測では、通常の worker 経路と pooled-input worker 経路のどちらも、in-flight slot 2 個により約 39.5 fps に到達しています。
 
-まずは以下を推奨値にしています。
-
-```nim
-let runner = det.openAsyncVStreamRunner(slotCount = 2).get()
+```text
+loops      : 100
+slots      : 2
+queue      : 4
+fps        : 39.5
+avg write  : 約 3.1 ms
+avg read   : 約 25.2 ms
+avg parse  : 約 0.01 ms
 ```
 
-手元の計測では、slot を 2 より増やしても大きな改善はありませんでした。
+実用上の開始点は以下です。
+
+```nim
+let slotCount = 2
+let requestQueueSize = recommendedThreadtoolsDetectorWorkerRequestQueueSize(slotCount)
+```
+
+この数値はボード込みの実測値であり、HAILO-8L 単体の一般的な上限値ではありません。より高速な host platform、PCIe 経路、HEF、前処理・後処理の違いにより結果は変わります。
 
 実際の性能は以下に依存します。
 
 - HEF とモデルサイズ
 - Hailo デバイス種別
-- host CPU
+- host SoC / CPU
 - PCIe 経路
 - input / output vstream format
 - アプリ側の前処理・後処理
+- queue depth と upstream producer の挙動
 
 ## 🧭 設計方針
 
@@ -340,11 +394,14 @@ let runner = det.openAsyncVStreamRunner(slotCount = 2).get()
 Detector:
   同期版 YOLO / NMS-by-class detection
 
-AsyncVStreamRunner:
+ThreadtoolsVStreamRunner:
   汎用 vstream write/read overlap
 
-AsyncDetector:
-  async YOLO / NMS-by-class detection
+ThreadtoolsDetector:
+  threadtools vstream runner + YOLO NMS-by-class parse
+
+ThreadtoolsDetectorWorker:
+  application pipeline 向け request/reply queue API
 
 Application:
   video decode, preprocessing, rendering, encoding, frame drop policy
@@ -352,15 +409,17 @@ Application:
 
 巨大な万能 pipeline にするのではなく、小さく組み合わせやすい部品を提供する方針です。
 
+pipeline 用 API としては threadtools 経路を優先します。async 連携は、後で threadtools 経路の上に bridge として載せ、性能と所有権管理に問題がない形にできた段階で戻す方針です。
+
 ## 🛣️ 今後の候補
 
-- より高レベルな async object detection helper
+- codec pipeline 向けの PoolItem ベース output/result path
+- threadtools 経路の上に載せる async bridge
 - pose estimation wrapper
 - segmentation wrapper
 - classification helper
 - ナンバープレート検出・認識 pipeline
-- GStreamer 連携 example
-- polling ではなく eventfd を使った completion notification
+- GStreamer / libav pipeline example
 - 詳細 benchmark tools
 
 ## 📄 License
