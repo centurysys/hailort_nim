@@ -13,8 +13,8 @@ The current high-level API is focused on YOLO-style object detection models that
 - Explicit open / activate / deactivate / close lifecycle control
 - Multi-HEF preparation and fast model switching
 - Optional inference profiling for the high-level `Detector`
-- Optional async-style vstream runner for higher-throughput pipelines
-- `AsyncDetector` wrapper for async YOLO / NMS-by-class detection
+- Optional `threadtools`-based detector runner for streaming / pipeline-style applications
+- Worker-style submit / receive API with request correlation metadata
 - Embedded / edge-device oriented design
 
 ## ⚠️ Important usage rule
@@ -157,120 +157,143 @@ The profiled stages include:
 
 This is useful for checking whether time is spent in host-side code, HailoRT transfer, or device execution wait.
 
-## ⚡ Async vstream support
+## 🧵 Threadtools detector support
 
-`hailort_nim` includes optional async-style vstream support for applications that need higher throughput.
+`hailort_nim` includes optional `threadtools` integration for applications that continuously feed frames or tensors into HAILO from worker-based pipelines.
 
-The goal is to overlap:
+The goal is to keep HAILO busy while avoiding an `asyncdispatch`-centric API around blocking HailoRT vstream reads.
 
-- input vstream writes
-- blocking output vstream reads
-- application-side post-processing
+The threadtools path provides two levels:
 
-HailoRT vstream `read()` is blocking. `AsyncVStreamRunner` keeps the input write on the caller thread, but moves the blocking output read path to an internal read thread.
+```text
+ThreadtoolsVStreamRunner:
+  model-agnostic vstream write/read overlap
+  caller submits input buffers
+  internal read worker waits for output vstream results
 
-This improves pipeline structure without requiring raw stream async APIs.
+ThreadtoolsDetector:
+  ThreadtoolsVStreamRunner + YOLO NMS-by-class parsing
+  caller submits input buffers and receives parsed detections
 
-### 🧱 Build requirements
+ThreadtoolsDetectorWorker:
+  request queue + reply queue + detector worker thread
+  suitable for application / codec pipeline integration
+```
 
-Async vstream support uses Nim threads internally.
+### Build requirements
 
-Build examples or applications using it with:
+Enable the threadtools path with `-d:hailortThreadtools`.
 
 ```bash
-nim c --threads:on -d:hailortAsyncVstream -d:release examples/async_vstream_runner_split_task_probe.nim
+nim c -d:hailortThreadtools -d:release examples/threadtools_detector_worker_probe.nim
 ```
 
-The normal synchronous API can remain usable without `--threads:on` when async vstream exports are guarded behind `-d:hailortAsyncVstream`.
+Recent Nim 2.x environments may enable threads by default. If your configuration does not, add `--threads:on`.
 
-A typical top-level export guard looks like this:
+The threadtools path depends on the `threadtools` and `move_results` packages being visible to Nimble or Nim's module search path.
 
-```nim
-when defined(hailortAsyncVstream):
-  import ./hailort_nim/highlevel/async_vstream_runner
-  import ./hailort_nim/highlevel/async_detector
-  export async_vstream_runner
-  export async_detector
-```
+### ThreadtoolsDetector
 
-### 🧵 AsyncVStreamRunner
-
-`AsyncVStreamRunner` is model-agnostic. It only handles vstream I/O overlap and output slot management.
+`ThreadtoolsDetector` is useful when the caller wants direct control over submit / receive order while keeping the blocking output read on the internal vstream read worker.
 
 ```nim
 let det = Detector.open("yolov11s.hef").get()
 defer:
   discard det.close()
 
-let runner = det.openAsyncVStreamRunner(slotCount = 2).get()
+let tdet = det.openThreadtoolsDetector(slotCount = 2, appScoreThreshold = 0.25'f32).get()
 defer:
-  discard runner.close()
+  discard tdet.close()
+
+discard tdet.submit(input)
+
+var detections: seq[Detection] = @[]
+let r = tdet.waitDetections(detections)
+if r.isErr:
+  quit($r.error)
 ```
 
-The recommended split-task API is:
+The output slot is released internally after parsing, so callers do not need to handle vstream output pointer lifetime directly in this path.
+
+### ThreadtoolsDetectorWorker
+
+`ThreadtoolsDetectorWorker` is the preferred API for pipeline-style applications.
+
+It owns a detector worker thread and exposes a queue-oriented interface:
 
 ```nim
-let ready = await runner.waitWritable()
-if ready.isErr:
-  quit($ready.error)
+let worker = openThreadtoolsDetectorWorker(
+  "yolov11s.hef",
+  slotCount = 2,
+  requestQueueSize = recommendedThreadtoolsDetectorWorkerRequestQueueSize(2),
+  appScoreThreshold = 0.25'f32
+).get()
 
-let readFuture = runner.writeAsync(input).get()
+discard worker.submitCopy(
+  requestId = 0'u64,
+  input = input,
+  userData = 10000'u64
+)
 
-# readFuture can be passed to another async task.
+var reply: ThreadtoolsDetectorWorkerReply
+let rr = worker.waitReply(reply)
+if rr.isErr:
+  quit($rr.error)
 
-let result = (await readFuture).get()
+echo reply.requestId
+for det in reply.detections:
+  echo det
 
-try:
-  # Parse or consume result.outputPtr / result.outputSize here.
-  discard
-finally:
-  discard runner.releaseResult(result)
+discard worker.stop()
+discard worker.join()
 ```
 
-Why the API is split:
+For pipeline usage, prefer `submit()` with a moved `seq[byte]` when the input buffer ownership can be transferred to the worker.
 
-- `waitWritable()` is async and may await an output slot.
-- `writeAsync()` is intentionally not an async proc.
-- This avoids capturing `openArray[byte]` across an `await` boundary.
-- The input buffer is consumed synchronously by `inputVstream.write()`.
+Use `submitCopy()` as a convenience API when the caller owns an `openArray[byte]` or wants to keep the original buffer.
 
-### 📦 AsyncVStreamResult
+### Request correlation
 
-`AsyncVStreamResult` contains:
-
-```nim
-type
-  AsyncVStreamResult* = object
-    slotIndex*: int
-    outputPtr*: pointer
-    outputSize*: int
-    writeUs*: int64
-    readUs*: int64
-```
-
-The output buffer is owned by `AsyncVStreamRunner`. The caller may read `outputPtr` until `releaseResult()` is called.
-
-Always release the result:
-
-```nim
-discard runner.releaseResult(result)
-```
-
-If results are not released, output slots are not returned to the runner.
-
-### 🔎 AsyncDetector
-
-`AsyncDetector` is a YOLO / NMS-by-class wrapper built on top of `AsyncVStreamRunner`.
+Worker requests and replies carry two correlation fields:
 
 ```text
-AsyncVStreamRunner:
-  model-agnostic vstream I/O overlap
+requestId:
+  sequential or application-defined request identifier
 
-AsyncDetector:
-  AsyncVStreamRunner + YOLO NMS-by-class parsing
+userData:
+  opaque uint64 for application metadata
 ```
 
-This separation keeps the async vstream runner reusable for other model families such as pose estimation, segmentation, classification, OCR, or license plate recognition.
+This allows applications to associate results with camera, frame, event, or timestamp identifiers without relying only on receive order.
+
+Error replies preserve the same metadata so failed requests can also be traced.
+
+### Queue depth
+
+For `slotCount = 2`, use a request queue size of at least 4.
+
+A queue depth equal to the slot count can underfill the worker pipeline and leave the HAILO vstream path idle between replies.
+
+Use:
+
+```nim
+let qsize = recommendedThreadtoolsDetectorWorkerRequestQueueSize(slotCount)
+```
+
+Current testing on TI AM67A (4x Cortex-A53 at 1.4 GHz) with HAILO-8L and YOLOv11s showed that increasing the request queue beyond `slotCount * 2` did not improve throughput, but it can still be useful if the application intentionally wants more input buffering.
+
+### Shutdown
+
+The worker supports explicit graceful shutdown:
+
+```nim
+discard worker.stop()
+discard worker.join()
+```
+
+`close()` is a convenience wrapper for stop plus join.
+
+`stop()` is graceful: already-submitted requests are drained before the worker exits. New submissions are rejected after stopping begins.
 
 ## 🧪 Examples
 
@@ -288,49 +311,52 @@ nim c -d:release examples/infer_high_profile.nim
 ./examples/infer_high_profile yolov11n.hef dog_640x640x3.raw 50 5
 ```
 
-### ⚡ Async vstream runner probe
+### 🧵 Threadtools detector probe
 
 ```bash
-nim c --threads:on -d:hailortAsyncVstream -d:release examples/async_vstream_runner_probe.nim
-./examples/async_vstream_runner_probe yolov11s.hef dog.raw 100 2
+nim c -d:hailortThreadtools -d:release examples/threadtools_detector_probe.nim
+./examples/threadtools_detector_probe yolov11s.hef dog.raw 100 2 0.25
 ```
 
-### 🔎 Async detector probe
+### 🧵 Threadtools detector worker probe
 
 ```bash
-nim c --threads:on -d:hailortAsyncVstream -d:release examples/async_detector_probe.nim
-./examples/async_detector_probe yolov11s.hef dog.raw 100 2 0.25
-```
-
-### 🧩 Split async task probe
-
-This example demonstrates an application-like structure where the write task and read/result task are separated.
-
-```bash
-nim c --threads:on -d:hailortAsyncVstream -d:release examples/async_vstream_runner_split_task_probe.nim
-./examples/async_vstream_runner_split_task_probe yolov11s.hef dog.raw 100 2
+nim c -d:hailortThreadtools -d:release examples/threadtools_detector_worker_probe.nim
+./examples/threadtools_detector_worker_probe yolov11s.hef dog.raw 100 2 4 0.25
 ```
 
 ## 📈 Throughput notes
 
-In local HAILO-8L testing with YOLOv11 models, two in-flight slots were enough to significantly improve throughput compared with a strictly synchronous write/read loop.
+On TI AM67A (4x Cortex-A53 at 1.4 GHz) with HAILO-8L and a YOLOv11s HEF, the threadtools detector worker path reached about 39.5 fps with two in-flight slots:
+
+```text
+loops      : 100
+slots      : 2
+queue      : 4
+fps        : 39.5
+avg write  : about 3.1 ms
+avg read   : about 25.2 ms
+avg parse  : about 0.01 ms
+```
 
 A practical starting point is:
 
 ```nim
-let runner = det.openAsyncVStreamRunner(slotCount = 2).get()
+let slotCount = 2
+let requestQueueSize = recommendedThreadtoolsDetectorWorkerRequestQueueSize(slotCount)
 ```
 
-Increasing the slot count beyond two did not improve throughput in those tests.
+This number is a board-level measurement, not a universal HAILO-8L maximum. Faster host platforms, different PCIe paths, different HEFs, or different pre/post-processing paths may produce different results.
 
 Actual performance depends on:
 
 - HEF and model size
 - Hailo device type
-- host CPU
+- host SoC / CPU
 - PCIe path
 - input and output vstream formats
 - application-side preprocessing and post-processing
+- queue depth and upstream producer behavior
 
 ## 🧭 Design notes
 
@@ -340,11 +366,14 @@ Actual performance depends on:
 Detector:
   synchronous YOLO / NMS-by-class detection
 
-AsyncVStreamRunner:
+ThreadtoolsVStreamRunner:
   generic vstream write/read overlap
 
-AsyncDetector:
-  async YOLO / NMS-by-class detection
+ThreadtoolsDetector:
+  threadtools vstream runner + YOLO NMS-by-class parsing
+
+ThreadtoolsDetectorWorker:
+  request/reply queue API for application pipelines
 
 Application:
   video decode, preprocessing, rendering, encoding, frame dropping policy
@@ -352,17 +381,19 @@ Application:
 
 This keeps the library usable as small, composable parts rather than forcing one large pipeline abstraction.
 
+The threadtools path is the preferred pipeline API. Async integration should be built later as a bridge on top of the threadtools path if it can be done without hurting performance or ownership clarity.
+
 ## 🛣️ Future work
 
 Possible future directions:
 
-- Higher-level async object detection helpers
+- PoolItem-based zero-copy input/output paths for codec pipelines
+- Async bridge built on top of the threadtools path
 - Pose estimation wrappers
 - Segmentation wrappers
 - Classification helpers
 - License plate detection / recognition pipelines
-- GStreamer integration examples
-- Eventfd-based completion notification to replace polling
+- GStreamer / libav pipeline examples
 - More detailed benchmarking tools
 
 ## 📄 License
