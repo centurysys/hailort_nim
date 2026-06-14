@@ -303,7 +303,7 @@ proc makeInputVstreamParams*(ng: NetworkGroup, formatType: hailo_format_type_t =
     HE[seq[InputVstreamParamsByName]] =
   if ng.isNil or ng.ng.isNil:
     return makeError(HAILO_INVALID_ARGUMENT, "network group is nil").err
-  var count: csize_t = 8
+  var count: csize_t = csize_t(HAILO_MAX_STREAMS_COUNT)
   while true:
     var params = newSeq[InputVstreamParamsByName](int(count))
     var actualCount = count
@@ -324,7 +324,7 @@ proc makeOutputVstreamParams*(ng: NetworkGroup, formatType: hailo_format_type_t 
     HE[seq[OutputVstreamParamsByName]] =
   if ng.isNil or ng.ng.isNil:
     return makeError(HAILO_INVALID_ARGUMENT, "network group is nil").err
-  var count: csize_t = 8
+  var count: csize_t = csize_t(HAILO_MAX_STREAMS_COUNT)
   while true:
     var params = newSeq[OutputVstreamParamsByName](int(count))
     var actualCount = count
@@ -344,7 +344,7 @@ proc makeOutputVstreamParams*(ng: NetworkGroup, formatType: hailo_format_type_t 
 proc getOutputVstreamGroups*(ng: NetworkGroup): HE[seq[OutputVstreamNameByGroup]] =
   if ng.isNil or ng.ng.isNil:
     return makeError(HAILO_INVALID_ARGUMENT, "network group is nil").err
-  var count: csize_t = 8
+  var count: csize_t = csize_t(HAILO_MAX_STREAMS_COUNT)
   while true:
     var items = newSeq[OutputVstreamNameByGroup](int(count))
     var actualCount = count

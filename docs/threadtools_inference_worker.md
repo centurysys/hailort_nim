@@ -8,7 +8,7 @@ This note describes how to use `hailort_nim` with non-YOLO HEFs, especially cust
 
 `ThreadtoolsDetectorWorker` is intended for YOLO / NMS-by-class models.
 
-`ThreadtoolsInferenceWorker` is a generic worker where the output parser can be selected later.
+`ThreadtoolsInferenceWorker` is a generic worker where the output parser can be selected later. It is for single-output HEFs. For HEFs with multiple output vstreams, such as YOLOv8 pose, use `ThreadtoolsMultiOutputInferenceWorker` instead.
 
 ```text
 ThreadtoolsVStreamRunner
@@ -18,10 +18,13 @@ ThreadtoolsDetectorWorker
   YOLO / HAILO_NMS_BY_CLASS worker
 
 ThreadtoolsInferenceWorker
-  generic worker for raw tensor / text detection / custom parsers
+  generic worker for raw tensor / text detection / custom single-output parsers
+
+ThreadtoolsMultiOutputInferenceWorker
+  generic worker for multi-output parsers such as YOLOv8 pose
 ```
 
-For ordinary YOLO use, keep using `ThreadtoolsDetectorWorker`. For custom models, classification, segmentation, OCR, or text detection, start with `ThreadtoolsInferenceWorker` and the raw tensor parser, inspect the output, then add a model-specific parser.
+For ordinary single-output YOLO use, keep using `ThreadtoolsDetectorWorker`. For custom single-output models, classification, OCR, or text detection, start with `ThreadtoolsInferenceWorker` and the raw tensor parser, inspect the output, then add a model-specific parser. For multi-output models, inspect them with `MultiOutputInference` first and then use `ThreadtoolsMultiOutputInferenceWorker` once a parser exists. See `threadtools_multi_output_inference_worker.md` for the YOLOv8 pose path.
 
 ## 2. Basic rule
 

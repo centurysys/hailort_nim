@@ -2,9 +2,9 @@
 
 `hailort_nim` は、HailoRT を Nim から使うための binding / high-level helper ライブラリです。
 
-HAILO-8 / HAILO-8L デバイスで推論を実行するための低レベル API と、YOLO 系モデルを扱いやすくする高レベル API を提供します。
+HAILO-8 / HAILO-8L デバイスで推論を実行するための低レベル API と、YOLO 系モデル、raw/custom model、multi-output pose model を扱いやすくする高レベル API を提供します。
 
-現在の high-level API は、主に `HAILO_FORMAT_ORDER_HAILO_NMS_BY_CLASS` を出力する YOLO 系 object detection モデルを対象にしています。
+high-level API は、`HAILO_FORMAT_ORDER_HAILO_NMS_BY_CLASS` を出力する YOLO 系 object detection モデル、raw/custom single-output モデル、そして YOLOv8 pose のような一部の multi-output モデルを対象にしています。
 
 ## ✨ 特長
 
@@ -16,8 +16,11 @@ HAILO-8 / HAILO-8L デバイスで推論を実行するための低レベル API
 - streaming / pipeline 型アプリ向けの optional `threadtools` 連携
 - request correlation metadata 付きの worker 型 submit / receive API
 - pipeline 型の所有権移動に向いた `threadtools` pool item 入力
-- raw tensor / 独自モデル出力向けの generic `ThreadtoolsInferenceWorker`
+- raw tensor / 独自 single-output モデル出力向けの generic `ThreadtoolsInferenceWorker`
+- 複数 output vstream を持つ HEF 用の `MultiOutputInference`
+- multi-output pipeline 用の `ThreadtoolsMultiOutputInferenceWorker`
 - UINT8 score map 出力向けの簡易 text detection parser
+- bbox + 17 keypoints を返す YOLOv8 pose parser
 - 組み込み Linux / edge device 向けの設計
 
 ## ⚠️ 重要: open / close をフレームループ内で繰り返さない
@@ -166,7 +169,7 @@ host 側処理、HailoRT 転送、デバイス実行待ちのどこで時間を�
 
 目的は、blocking な HailoRT vstream read を `asyncdispatch` 中心の API で無理に包まず、HAILO を埋め続けられる構成を作ることです。
 
-threadtools 経路は、以下の 3 段に分かれています。
+threadtools 経路は、以下のような段階に分かれています。
 
 ```text
 ThreadtoolsVStreamRunner:
@@ -180,7 +183,14 @@ ThreadtoolsDetector:
 
 ThreadtoolsDetectorWorker:
   request queue + reply queue + detector worker thread
-  application / codec pipeline から使うための API
+  single-output YOLO application / codec pipeline から使うための API
+
+ThreadtoolsInferenceWorker:
+  raw tensor / text detection / custom single-output parser 用 request/reply queue
+
+ThreadtoolsMultiOutputInferenceWorker:
+  multi-output HEF 用 request/reply queue
+  現時点では YOLOv8 pose decode に対応
 ```
 
 ### ビルド条件
@@ -348,6 +358,54 @@ echo outputMeta.name
 
 raw output の調査手順、独自 parser の追加方針、thread 間 reply の所有権ルールは `docs/threadtools_inference_worker.ja.md` にまとめています。
 
+
+## 🧍 YOLOv8 pose multi-output support
+
+`hailort_nim` には、`yolov8s_pose` のような multi-output pose HEF 用に、再利用可能な YOLOv8 pose parser と threadtools worker path が入っています。
+
+NMS-by-class の YOLO object detection HEF と違い、`yolov8s_pose` は複数の output vstream を持ちます。検証した HAILO-8L 向けモデルでは、grid scale ごとに 3種類の出力があります。
+
+```text
+bbox regression: H x W x 64   # YOLOv8 DFL logits, 4 sides * 16 bins
+person score   : H x W x 1
+keypoints      : H x W x 51   # 17 keypoints * (x, y, score/logit)
+```
+
+HAILO runtime が返すのは tensor なので、ライブラリ側の parser が CPU postprocess を行います。
+
+```text
+FLOAT32 multi-output tensors
+  ↓ grid size ごとに bbox / score / keypoint head を grouping
+  ↓ YOLOv8 DFL bbox regression decode
+  ↓ COCO 17 keypoints decode
+  ↓ score threshold
+  ↓ bbox IoU NMS
+PoseResult
+```
+
+主な result 型:
+
+```text
+PoseResult
+  poses: seq[PoseDetection]
+
+PoseDetection
+  bbox
+  score
+  center
+  sourceScale / cellX / cellY
+  keypoints[17]
+
+PoseKeypoint
+  x / y / score
+```
+
+bbox だけを既存の YOLO 風 consumer へ渡したい場合、`PoseDetection` は normalized `Detection` へ変換できます。この互換変換では keypoint 情報は意図的に捨てます。
+
+複数 output vstream を持つモデルでは `ThreadtoolsMultiOutputInferenceWorker` を使います。single-output NMS-by-class YOLO object detection では、従来どおり `ThreadtoolsDetectorWorker` が簡単です。
+
+API 詳細と ownership rule は `docs/threadtools_multi_output_inference_worker.ja.md` を参照してください。
+
 ## 🔤 Text detection parser
 
 `hailort_nim` には、`paddle_ocr_v5_mobile_detection` のようなモデル向けに、初期版の CPU 側 text detection parser も追加しています。
@@ -428,6 +486,29 @@ overlay を PNG に変換する例:
 ffmpeg -y -i overlay.ppm overlay.png
 ```
 
+
+### 🧍 Multi-output YOLOv8 pose probe
+
+```bash
+nim c -d:release examples/multi_output_yolov8_pose_probe.nim
+./examples/multi_output_yolov8_pose_probe yolov8s_pose.hef pose_test_640x640_rgb.raw 0.25 100 pose_overlay.ppm 0.5 0.45 20
+```
+
+この同期 probe は `MultiOutputInference` を使い、FLOAT32 output tensor を要求して、YOLOv8 pose result を decode し、bbox/keypoint を表示して PPM overlay を出力します。
+
+### 🧵 Threadtools YOLOv8 pose worker probe
+
+```bash
+nim c -d:hailortThreadtools -d:release examples/threadtools_yolov8_pose_probe.nim
+./examples/threadtools_yolov8_pose_probe yolov8s_pose.hef pose_test_640x640_rgb.raw 10 0.25 100 pose_worker_overlay.ppm 0.5 0.45 20
+```
+
+overlay を PNG に変換:
+
+```bash
+ffmpeg -y -i pose_worker_overlay.ppm pose_worker_overlay.png
+```
+
 ## 📈 スループットに関するメモ
 
 TI AM67A（Cortex-A53 1.4 GHz x 4 コア） + HAILO-8L + YOLOv11s HEF の計測では、通常の worker 経路と pooled-input worker 経路のどちらも、in-flight slot 2 個により約 39.5 fps に到達しています。
@@ -450,6 +531,22 @@ let requestQueueSize = recommendedThreadtoolsDetectorWorkerRequestQueueSize(slot
 ```
 
 この数値はボード込みの実測値であり、HAILO-8L 単体の一般的な上限値ではありません。より高速な host platform、PCIe 経路、HEF、前処理・後処理の違いにより結果は変わります。
+
+
+
+同じ board / HAILO-8L で multi-output `yolov8s_pose` HEF を release build で実行した場合、pre-resize 済みの 640 x 640 RGB input を繰り返し処理する条件で約 37 fps でした。
+
+```text
+loops          : 10
+poses          : 3 on a three-person test image
+avg write      : about 1.2 ms
+avg read       : about 22 ms
+avg parse      : about 0.8 ms
+profile total  : about 26.7 ms
+fps            : about 37.5
+```
+
+`avg parse` には YOLOv8 pose decode と bbox NMS が含まれます。camera capture、resize/letterbox、描画、video encode などの application-side 処理は含まれていません。
 
 実際の性能は以下に依存します。
 
@@ -479,7 +576,13 @@ ThreadtoolsDetectorWorker:
   YOLO application pipeline 向け request/reply queue API
 
 ThreadtoolsInferenceWorker:
-  raw tensor / custom parser pipeline 向け request/reply queue API
+  raw tensor / custom single-output parser pipeline 向け request/reply queue API
+
+MultiOutputInference:
+  multi-output HEF の同期実行と output tensor 収集
+
+ThreadtoolsMultiOutputInferenceWorker:
+  YOLOv8 pose のような multi-output parser pipeline 向け request/reply queue API
 
 Application:
   video decode, preprocessing, rendering, encoding, frame drop policy
@@ -495,7 +598,7 @@ pipeline 用 API としては threadtools 経路を優先します。async 連�
 - OCR recognizer 向け crop / resize helper
 - codec pipeline 向けの PoolItem ベース output/result path
 - threadtools 経路の上に載せる async bridge
-- pose estimation wrapper
+- pose-model variant 追加と unified multi-output parser mode
 - segmentation wrapper
 - classification helper
 - ナンバープレート検出・認識 pipeline

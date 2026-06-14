@@ -4,7 +4,7 @@
 
 It provides low-level access to the HailoRT C API and higher-level APIs for running inference on HAILO-8 / HAILO-8L devices from Nim applications.
 
-The current high-level API is focused on YOLO-style object detection models that output `HAILO_FORMAT_ORDER_HAILO_NMS_BY_CLASS`.
+The high-level API covers YOLO-style object detection models that output `HAILO_FORMAT_ORDER_HAILO_NMS_BY_CLASS`, raw/custom single-output models, and selected multi-output models such as YOLOv8 pose.
 
 ## ✨ Features
 
@@ -16,8 +16,11 @@ The current high-level API is focused on YOLO-style object detection models that
 - Optional `threadtools`-based detector runner for streaming / pipeline-style applications
 - Worker-style submit / receive API with request correlation metadata
 - Pooled input submission using `threadtools` pool items for pipeline-style ownership transfer
-- Generic `ThreadtoolsInferenceWorker` for raw tensor / custom model outputs
+- Generic `ThreadtoolsInferenceWorker` for raw tensor / custom single-output model outputs
+- `MultiOutputInference` for HEFs with multiple output vstreams
+- `ThreadtoolsMultiOutputInferenceWorker` for multi-output worker pipelines
 - Simple text detection parser for UINT8 score-map outputs
+- YOLOv8 pose parser for bbox + 17-keypoint pose results
 - Embedded / edge-device oriented design
 
 ## ⚠️ Important usage rule
@@ -166,7 +169,7 @@ This is useful for checking whether time is spent in host-side code, HailoRT tra
 
 The goal is to keep HAILO busy while avoiding an `asyncdispatch`-centric API around blocking HailoRT vstream reads.
 
-The threadtools path provides two levels:
+The threadtools path provides several levels:
 
 ```text
 ThreadtoolsVStreamRunner:
@@ -180,7 +183,14 @@ ThreadtoolsDetector:
 
 ThreadtoolsDetectorWorker:
   request queue + reply queue + detector worker thread
-  suitable for application / codec pipeline integration
+  suitable for single-output YOLO application / codec pipeline integration
+
+ThreadtoolsInferenceWorker:
+  request queue + reply queue for raw tensor / text detection / custom single-output parsers
+
+ThreadtoolsMultiOutputInferenceWorker:
+  request queue + reply queue for multi-output HEFs
+  currently supports YOLOv8 pose decoding
 ```
 
 ### Build requirements
@@ -348,6 +358,54 @@ echo outputMeta.name
 
 See `docs/threadtools_inference_worker.md` for details on raw output inspection, custom parser flow, and thread-safe reply ownership rules.
 
+
+## 🧍 YOLOv8 pose multi-output support
+
+`hailort_nim` includes a reusable YOLOv8 pose parser and a threadtools worker path for multi-output pose HEFs such as `yolov8s_pose`.
+
+Unlike NMS-by-class YOLO object detection HEFs, `yolov8s_pose` exposes multiple output vstreams. The tested HAILO-8L model has three output groups, one per grid scale. Each group contains:
+
+```text
+bbox regression: H x W x 64   # YOLOv8 DFL logits, 4 sides * 16 bins
+person score   : H x W x 1
+keypoints      : H x W x 51   # 17 keypoints * (x, y, score/logit)
+```
+
+The HAILO runtime returns tensors; the library-side parser performs the CPU postprocess:
+
+```text
+FLOAT32 multi-output tensors
+  ↓ group bbox / score / keypoint heads by grid size
+  ↓ decode YOLOv8 DFL bbox regression
+  ↓ decode 17 COCO keypoints
+  ↓ score threshold
+  ↓ bbox IoU NMS
+PoseResult
+```
+
+Main result types:
+
+```text
+PoseResult
+  poses: seq[PoseDetection]
+
+PoseDetection
+  bbox
+  score
+  center
+  sourceScale / cellX / cellY
+  keypoints[17]
+
+PoseKeypoint
+  x / y / score
+```
+
+`PoseDetection` can also be converted to the existing normalized `Detection` type when a bbox-only YOLO-like view is needed. Keypoint data is intentionally dropped in that compatibility conversion.
+
+Use `ThreadtoolsMultiOutputInferenceWorker` when the model has multiple output vstreams. `ThreadtoolsDetectorWorker` remains the simple path for single-output NMS-by-class YOLO object detection.
+
+See `docs/threadtools_multi_output_inference_worker.md` for API details and ownership rules.
+
 ## 🔤 Text detection parser
 
 `hailort_nim` also includes an initial CPU-side text detection parser for models such as `paddle_ocr_v5_mobile_detection`.
@@ -428,6 +486,29 @@ Convert the overlay to PNG if needed:
 ffmpeg -y -i overlay.ppm overlay.png
 ```
 
+
+### 🧍 Multi-output YOLOv8 pose probe
+
+```bash
+nim c -d:release examples/multi_output_yolov8_pose_probe.nim
+./examples/multi_output_yolov8_pose_probe yolov8s_pose.hef pose_test_640x640_rgb.raw 0.25 100 pose_overlay.ppm 0.5 0.45 20
+```
+
+This synchronous probe uses `MultiOutputInference`, requests FLOAT32 output tensors, decodes YOLOv8 pose results, prints bbox/keypoint data, and writes a PPM overlay.
+
+### 🧵 Threadtools YOLOv8 pose worker probe
+
+```bash
+nim c -d:hailortThreadtools -d:release examples/threadtools_yolov8_pose_probe.nim
+./examples/threadtools_yolov8_pose_probe yolov8s_pose.hef pose_test_640x640_rgb.raw 10 0.25 100 pose_worker_overlay.ppm 0.5 0.45 20
+```
+
+Convert the overlay to PNG if needed:
+
+```bash
+ffmpeg -y -i pose_worker_overlay.ppm pose_worker_overlay.png
+```
+
 ## 📈 Throughput notes
 
 On TI AM67A (4x Cortex-A53 at 1.4 GHz) with HAILO-8L and a YOLOv11s HEF, both the normal worker path and the pooled-input worker path reached about 39.5 fps with two in-flight slots:
@@ -448,6 +529,22 @@ A practical starting point is:
 let slotCount = 2
 let requestQueueSize = recommendedThreadtoolsDetectorWorkerRequestQueueSize(slotCount)
 ```
+
+
+
+YOLOv8 pose on the same board with HAILO-8L and a multi-output `yolov8s_pose` HEF reached about 37 fps in release builds when repeatedly processing a pre-resized 640 x 640 RGB input:
+
+```text
+loops          : 10
+poses          : 3 on a three-person test image
+avg write      : about 1.2 ms
+avg read       : about 22 ms
+avg parse      : about 0.8 ms
+profile total  : about 26.7 ms
+fps            : about 37.5
+```
+
+The measured parser time includes YOLOv8 pose decode and bbox NMS.  Application-side preprocessing, camera capture, resize/letterbox, drawing, and video encode are not included in this number.
 
 This number is a board-level measurement, not a universal HAILO-8L maximum. Faster host platforms, different PCIe paths, different HEFs, or different pre/post-processing paths may produce different results.
 
@@ -479,7 +576,13 @@ ThreadtoolsDetectorWorker:
   request/reply queue API for YOLO application pipelines
 
 ThreadtoolsInferenceWorker:
-  request/reply queue API for raw tensor / custom parser pipelines
+  request/reply queue API for raw tensor / custom single-output parser pipelines
+
+MultiOutputInference:
+  synchronous multi-output HEF execution and output tensor collection
+
+ThreadtoolsMultiOutputInferenceWorker:
+  request/reply queue API for multi-output parser pipelines such as YOLOv8 pose
 
 Application:
   video decode, preprocessing, rendering, encoding, frame dropping policy
@@ -497,7 +600,7 @@ Possible future directions:
 - OCR recognizer crop / resize helpers
 - PoolItem-based output/result paths for codec pipelines
 - Async bridge built on top of the threadtools path
-- Pose estimation wrappers
+- Additional pose-model variants and unified multi-output parser modes
 - Segmentation wrappers
 - Classification helpers
 - License plate detection / recognition pipelines
