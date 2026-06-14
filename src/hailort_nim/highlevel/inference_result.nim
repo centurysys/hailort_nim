@@ -288,18 +288,39 @@ proc clear*(r: var RawTensorResult) =
   r.metadata = VStreamMetadata()
   `=destroy`(r.bytes)
 
-proc clear*(r: var HailoInferenceResult) =
-  ## Reset logical contents while keeping seq capacities where possible.
-  r.kind = hrkNone
-  r.requestId = 0'u64
-  r.userData = 0'u64
-  r.timing.clear()
-  r.detections.clear()
-  r.classification.clear()
-  r.textRegions.clear()
-  r.text.clear()
-  r.pose.clear()
-  r.raw.clear()
+proc clear*(r: var HailoInferenceResult) {.raises: [].} =
+  ## Reset the active logical payload while keeping inactive fields untouched.
+  ##
+  ## HailoInferenceResult is a normal object rather than an object variant, so all
+  ## payload fields physically exist.  However only the field selected by kind is
+  ## logically active.  When results are moved through ThreadQueue, clearing every
+  ## inactive field during teardown can touch moved-from/stale storage that never
+  ## belonged to the current result kind.  Clear only the active payload and then
+  ## reset the common metadata.
+  try:
+    let oldKind = r.kind
+    r.kind = hrkNone
+    r.requestId = 0'u64
+    r.userData = 0'u64
+    r.timing.clear()
+
+    case oldKind
+    of hrkNone:
+      discard
+    of hrkDetections:
+      r.detections.clear()
+    of hrkClassification:
+      r.classification.clear()
+    of hrkTextRegions:
+      r.textRegions.clear()
+    of hrkTextRecognition:
+      r.text.clear()
+    of hrkPose:
+      r.pose.clear()
+    of hrkRawTensor:
+      r.raw.clear()
+  except Exception:
+    discard
 
 proc resetKind*(r: var HailoInferenceResult; kind: HailoResultKind) =
   ## Clear previous payload and set the new logical result kind.

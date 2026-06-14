@@ -27,7 +27,9 @@ when defined(hailortThreadtools):
   import ./hailort_nim/highlevel/threadtools_detector
   import ./hailort_nim/highlevel/threadtools_detector_worker
   import ./hailort_nim/highlevel/threadtools_inference_worker
+  import ./hailort_nim/highlevel/threadtools_multi_output_inference_worker
   export threadtools_vstream_runner
   export threadtools_detector
   export threadtools_detector_worker
   export threadtools_inference_worker
+  export threadtools_multi_output_inference_worker
