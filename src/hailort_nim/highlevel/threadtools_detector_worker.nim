@@ -27,17 +27,28 @@ type
     requestQueueSize*: int
     replyQueueSize*: int
 
+  ThreadtoolsDetectorWorkerRequestKind* = enum
+    ## Request payload kind for ThreadtoolsDetectorWorker.
+    tdwrkReqStop
+    tdwrkReqSeq
+    tdwrkReqPooledSeq
+
   ThreadtoolsDetectorWorkerRequest* = object
     ## One inference request for ThreadtoolsDetectorWorker.
     ##
-    ## input is owned by the request.  Prefer submit(move input) for already
-    ## owned seq[byte] buffers.  submitCopy() is provided for openArray callers.
+    ## The worker accepts either an owned seq[byte] or a threadtools
+    ## Pooled[seq[byte]] / PoolItem[seq[byte]] token.  Prefer submit(move input)
+    ## for already-owned seq buffers, submitPooled(move item) for streaming
+    ## pipelines that reuse buffers from a pool, and submitCopy() for borrowed
+    ## openArray callers.
     ##
     ## requestId and userData are opaque caller-supplied correlation fields.
     ## Both are copied to the reply, including error replies.
+    kind*: ThreadtoolsDetectorWorkerRequestKind
     requestId*: uint64
     userData*: uint64
     input*: seq[byte]
+    pooledInput*: Pooled[seq[byte]]
     appScoreThreshold*: float32
 
   ThreadtoolsDetectorWorkerResult* = object
@@ -166,6 +177,30 @@ type
     userData: uint64
     appScoreThreshold: float32
 
+proc inputLen(req: var ThreadtoolsDetectorWorkerRequest): int {.inline.} =
+  case req.kind
+  of tdwrkReqStop:
+    result = 0
+  of tdwrkReqSeq:
+    result = req.input.len
+  of tdwrkReqPooledSeq:
+    if req.pooledInput.isActive:
+      result = req.pooledInput.value.len
+    else:
+      result = 0
+
+proc submitInput(
+  detector: ThreadtoolsDetector;
+  req: var ThreadtoolsDetectorWorkerRequest
+): HE[int] =
+  case req.kind
+  of tdwrkReqStop:
+    result = makeError(HAILO_INVALID_OPERATION, "stop request has no input").err
+  of tdwrkReqSeq:
+    result = detector.submit(req.input)
+  of tdwrkReqPooledSeq:
+    result = detector.submit(req.pooledInput.value)
+
 proc sendWorkerReply(
   state: ptr ThreadtoolsDetectorWorkerState;
   reply: sink ThreadtoolsDetectorWorkerReply
@@ -179,12 +214,26 @@ proc handleSubmitRequest(
   pending: var seq[PendingRequest]
 ): bool =
   ## Returns false when the worker should stop accepting new requests.
+  ##
+  ## Pooled input items are intentionally scoped to this procedure.  The HAILO
+  ## input vstream write is synchronous, so after submitInput() returns the
+  ## source buffer may be returned to its pool immediately while the output read
+  ## continues on the vstream runner's read worker.
   var ownedReq = move req
 
-  if ownedReq.input.len == 0:
+  if ownedReq.kind == tdwrkReqStop:
     return false
 
-  let submitRes = state.detector.submit(ownedReq.input)
+  if ownedReq.inputLen() == 0:
+    var reply = makeErrorReply(
+      ownedReq.requestId,
+      ownedReq.userData,
+      makeError(HAILO_INVALID_ARGUMENT, "detector worker request input is empty")
+    )
+    state.sendWorkerReply(move reply)
+    return true
+
+  let submitRes = state.detector.submitInput(ownedReq)
   if submitRes.isErr:
     var reply = makeErrorReply(ownedReq.requestId, ownedReq.userData, submitRes.error)
     state.sendWorkerReply(move reply)
@@ -442,6 +491,7 @@ proc stop*(w: ThreadtoolsDetectorWorker): HE[void] =
     return makeError(HAILO_INVALID_OPERATION, "detector worker request queue is nil").err
 
   var stopReq = ThreadtoolsDetectorWorkerRequest(
+    kind: tdwrkReqStop,
     requestId: 0'u64,
     userData: 0'u64,
     input: @[],
@@ -583,6 +633,7 @@ proc submit*(
     ).err
 
   var req = ThreadtoolsDetectorWorkerRequest(
+    kind: tdwrkReqSeq,
     requestId: requestId,
     userData: userData,
     input: move input,
@@ -594,6 +645,67 @@ proc submit*(
 
   result = okVoid()
 
+proc submitPooled*(
+  w: ThreadtoolsDetectorWorker;
+  input: sink Pooled[seq[byte]];
+  requestId: uint64 = 0'u64;
+  appScoreThreshold = 0.25'f32;
+  userData: uint64 = 0'u64
+): HE[void] =
+  ## Submit a pooled input buffer to the detector worker.
+  ##
+  ## This is the preferred streaming/pipeline API when frames are obtained from
+  ## a threadtools Pool[seq[byte]] or passed around as PoolItem[seq[byte]].  The
+  ## worker performs the HAILO input write synchronously and then lets the
+  ## PoolItem return the seq buffer to its original pool automatically.
+  if w.isNil:
+    return makeError(HAILO_INVALID_ARGUMENT, "detector worker is nil").err
+
+  if w.closed:
+    return makeError(HAILO_INVALID_OPERATION, "detector worker is closed").err
+
+  if w.stopping:
+    return makeError(HAILO_INVALID_OPERATION, "detector worker is stopping").err
+
+  if not w.running:
+    return makeError(HAILO_INVALID_OPERATION, "detector worker is not running").err
+
+  var ownedInput = move input
+  if not ownedInput.isActive:
+    return makeError(HAILO_INVALID_ARGUMENT, "pooled input is not active").err
+
+  if ownedInput.value.len == 0:
+    return makeError(HAILO_INVALID_ARGUMENT, "input is empty").err
+
+  if w.inputSize() > 0 and ownedInput.value.len != w.inputSize():
+    return makeError(
+      HAILO_INVALID_ARGUMENT,
+      &"input size mismatch: expected={w.inputSize()} actual={ownedInput.value.len}"
+    ).err
+
+  var req = ThreadtoolsDetectorWorkerRequest(
+    kind: tdwrkReqPooledSeq,
+    requestId: requestId,
+    userData: userData,
+    pooledInput: move ownedInput,
+    appScoreThreshold: appScoreThreshold
+  )
+  let sendRes = w.requestQ.sendMove(req)
+  if sendRes.isErr:
+    return threadtoolsError(sendRes.error, "send detector worker pooled request").err
+
+  result = okVoid()
+
+proc submitPoolItem*(
+  w: ThreadtoolsDetectorWorker;
+  input: sink Pooled[seq[byte]];
+  requestId: uint64 = 0'u64;
+  appScoreThreshold = 0.25'f32;
+  userData: uint64 = 0'u64
+): HE[void] {.inline.} =
+  ## Alias for submitPooled().
+  result = w.submitPooled(move input, requestId, appScoreThreshold, userData)
+
 proc submitCopy*(
   w: ThreadtoolsDetectorWorker;
   input: openArray[byte];
@@ -604,7 +716,7 @@ proc submitCopy*(
   ## Submit a borrowed input buffer by copying it into an owned seq[byte].
   ##
   ## This is convenient for tests and existing high-level code.  Streaming
-  ## pipelines should prefer submit(move seqBuf) or a future PoolItem-based API.
+  ## pipelines should prefer submit(move seqBuf) or submitPooled(move item).
   var owned = newSeq[byte](input.len)
   if input.len > 0:
     copyMem(addr owned[0], unsafeAddr input[0], input.len)
