@@ -94,6 +94,8 @@ type
     state: ThreadtoolsDetectorWorkerState
     config: ThreadtoolsDetectorWorkerConfig
     running: bool
+    stopping: bool
+    closed: bool
 
 # ==============================================================================
 # Small helpers
@@ -421,25 +423,59 @@ proc startThreadtoolsDetectorWorker*(
 
   result = d.startThreadtoolsDetectorWorker(runnerConfig, workerConfig)
 
-proc close*(w: ThreadtoolsDetectorWorker): HE[void] =
+proc stop*(w: ThreadtoolsDetectorWorker): HE[void] =
+  ## Request a graceful worker stop.
+  ##
+  ## stop() is idempotent.  It tells the worker to stop accepting new requests.
+  ## Requests already submitted to HAILO are drained before the worker thread exits.
+  ##
+  ## After stop(), callers may keep receiving the replies they expect, then call
+  ## join().  close() is equivalent to stop() + join() and is convenient when the
+  ## caller does not need to drain remaining replies.
   if w.isNil:
     return okVoid()
 
+  if w.closed or not w.running or w.stopping:
+    return okVoid()
+
+  if w.requestQ.isNil:
+    return makeError(HAILO_INVALID_OPERATION, "detector worker request queue is nil").err
+
+  var stopReq = ThreadtoolsDetectorWorkerRequest(
+    requestId: 0'u64,
+    userData: 0'u64,
+    input: @[],
+    appScoreThreshold: 0.0'f32
+  )
+  let sendRes = w.requestQ.sendMove(stopReq)
+  if sendRes.isErr:
+    return threadtoolsError(sendRes.error, "send detector worker stop request").err
+
+  w.stopping = true
+  result = okVoid()
+
+proc join*(w: ThreadtoolsDetectorWorker): HE[void] =
+  ## Wait for the detector worker to exit and release its owned resources.
+  ##
+  ## If stop() was not called yet, join() requests stop first.  The underlying
+  ## ThreadtoolsDetector is closed on the owner thread after the worker has
+  ## terminated.  The reply queue is then closed, so callers that need all replies
+  ## should drain them before calling join().
+  if w.isNil:
+    return okVoid()
+
+  if w.closed:
+    return okVoid()
+
   if w.running:
-    var stopReq = ThreadtoolsDetectorWorkerRequest(
-      requestId: 0'u64,
-      userData: 0'u64,
-      input: @[],
-      appScoreThreshold: 0.0'f32
-    )
-    let sendRes = w.requestQ.sendMove(stopReq)
-    if sendRes.isErr:
-      w.requestQ.close()
-      w.replyQ.close()
-      return threadtoolsError(sendRes.error, "send detector worker stop request").err
+    if not w.stopping:
+      let stopRes = w.stop()
+      if stopRes.isErr:
+        return stopRes.error.err
 
     joinThread(w.workerThread)
     w.running = false
+    w.stopping = false
 
   if not w.detector.isNil:
     let closeRes = w.detector.close()
@@ -457,8 +493,17 @@ proc close*(w: ThreadtoolsDetectorWorker): HE[void] =
   w.replyQ = nil
   w.state.requestQ = nil
   w.state.replyQ = nil
+  w.closed = true
 
   result = okVoid()
+
+proc close*(w: ThreadtoolsDetectorWorker): HE[void] =
+  ## Stop and join the detector worker.
+  ##
+  ## This is the normal RAII-style teardown helper.  Use stop() and join()
+  ## separately when the application wants to drain known outstanding replies
+  ## before closing the reply queue.
+  result = w.join()
 
 # ==============================================================================
 # Introspection
@@ -475,6 +520,18 @@ proc isRunning*(w: ThreadtoolsDetectorWorker): bool =
     return false
 
   result = w.running
+
+proc isStopping*(w: ThreadtoolsDetectorWorker): bool =
+  if w.isNil:
+    return false
+
+  result = w.stopping
+
+proc isClosed*(w: ThreadtoolsDetectorWorker): bool =
+  if w.isNil:
+    return true
+
+  result = w.closed
 
 proc inputSize*(w: ThreadtoolsDetectorWorker): int =
   if w.isNil or w.detector.isNil:
@@ -506,6 +563,12 @@ proc submit*(
   ## detection finishes.  For borrowed openArray data, use submitCopy().
   if w.isNil:
     return makeError(HAILO_INVALID_ARGUMENT, "detector worker is nil").err
+
+  if w.closed:
+    return makeError(HAILO_INVALID_OPERATION, "detector worker is closed").err
+
+  if w.stopping:
+    return makeError(HAILO_INVALID_OPERATION, "detector worker is stopping").err
 
   if not w.running:
     return makeError(HAILO_INVALID_OPERATION, "detector worker is not running").err
@@ -559,6 +622,9 @@ proc waitReply*(
   if w.isNil:
     return makeError(HAILO_INVALID_ARGUMENT, "detector worker is nil").err
 
+  if w.closed:
+    return makeError(HAILO_INVALID_OPERATION, "detector worker is closed").err
+
   var recvRes = w.replyQ.receiveResult()
   if recvRes.isErr:
     return threadtoolsError(recvRes.error, "receive detector worker reply").err
@@ -580,6 +646,9 @@ proc tryWaitReply*(
   ## Non-blocking receive of one worker reply.
   if w.isNil:
     return makeError(HAILO_INVALID_ARGUMENT, "detector worker is nil").err
+
+  if w.closed:
+    return makeError(HAILO_INVALID_OPERATION, "detector worker is closed").err
 
   var tmp: ThreadtoolsDetectorWorkerReply
   let recvRes = w.replyQ.tryReceive(tmp)

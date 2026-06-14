@@ -88,7 +88,8 @@ proc main() =
     "startThreadtoolsDetectorWorker"
   )
   defer:
-    discard worker.close()
+    if not worker.isClosed():
+      discard worker.close()
 
   echo &"hef={hefPath}"
   echo &"raw={rawPath}"
@@ -184,6 +185,8 @@ proc main() =
         inc submitted
 
   let elapsedUs = inMicroseconds(getMonoTime() - started)
+  quitIfErr(worker.stop(), "worker.stop")
+  quitIfErr(worker.join(), "worker.join")
   let elapsedMs = float(elapsedUs) / 1000.0
   let fps =
     if elapsedUs > 0:
