@@ -43,6 +43,7 @@ type
     inputFrameSize*: int
     outputFrameSizes*: seq[int]
     outputFormatType*: hailo_format_type_t
+    batchSize*: uint16
     profiling*: bool
     profile*: MultiOutputInferenceProfile
 
@@ -205,6 +206,7 @@ proc close*(m: MultiOutputInference): HE[void] =
   m.hef = nil
   m.runtime = nil
   m.ownsRuntime = false
+  m.batchSize = uint16(HAILO_DEFAULT_BATCH_SIZE)
 
   result = okVoid()
 
@@ -217,7 +219,8 @@ proc openPreparedWithRuntime(
   hefPath: string,
   ownsRuntime: bool,
   profiling = false,
-  outputFormatType: hailo_format_type_t = HAILO_FORMAT_TYPE_AUTO
+  outputFormatType: hailo_format_type_t = HAILO_FORMAT_TYPE_AUTO,
+  batchSize: uint16 = uint16(HAILO_DEFAULT_BATCH_SIZE)
 ): HE[MultiOutputInference] =
   if runtime.isNil or not runtime.isOpen():
     return makeError(HAILO_INVALID_ARGUMENT, "runtime is not open").err
@@ -237,7 +240,7 @@ proc openPreparedWithRuntime(
       discard runtime.close()
     return makeError(HAILO_INVALID_ARGUMENT, "runtime vdevice is nil").err
 
-  let ngRes = configureOne(vdevObj, hefObj)
+  let ngRes = configureOne(vdevObj, hefObj, batchSize)
   if ngRes.isErr:
     discard hefObj.close()
     if ownsRuntime:
@@ -369,6 +372,7 @@ proc openPreparedWithRuntime(
     inputFrameSize: inputFrameSizeRes.get,
     outputFrameSizes: outputFrameSizes,
     outputFormatType: outputFormatType,
+    batchSize: batchSize,
     profiling: profiling,
     profile: MultiOutputInferenceProfile()
   ).ok
@@ -378,14 +382,16 @@ proc openPrepared*(
   runtime: HailoRuntime,
   hefPath: string,
   profiling = false,
-  outputFormatType: hailo_format_type_t = HAILO_FORMAT_TYPE_AUTO
+  outputFormatType: hailo_format_type_t = HAILO_FORMAT_TYPE_AUTO,
+  batchSize: uint16 = uint16(HAILO_DEFAULT_BATCH_SIZE)
 ): HE[MultiOutputInference] =
   result = openPreparedWithRuntime(
     runtime,
     hefPath,
     ownsRuntime = false,
     profiling = profiling,
-    outputFormatType = outputFormatType
+    outputFormatType = outputFormatType,
+    batchSize = batchSize
   )
 
 proc openPrepared*(
@@ -393,7 +399,8 @@ proc openPrepared*(
   hefPath: string,
   schedulingAlgorithm: SchedulingAlgorithm = HAILO_SCHEDULING_ALGORITHM_NONE,
   profiling = false,
-  outputFormatType: hailo_format_type_t = HAILO_FORMAT_TYPE_AUTO
+  outputFormatType: hailo_format_type_t = HAILO_FORMAT_TYPE_AUTO,
+  batchSize: uint16 = uint16(HAILO_DEFAULT_BATCH_SIZE)
 ): HE[MultiOutputInference] =
   var runtimeRes = HailoRuntime.open(schedulingAlgorithm)
   if runtimeRes.isErr:
@@ -404,7 +411,8 @@ proc openPrepared*(
     hefPath,
     ownsRuntime = true,
     profiling = profiling,
-    outputFormatType = outputFormatType
+    outputFormatType = outputFormatType,
+    batchSize = batchSize
   )
 
 proc open*(
@@ -412,13 +420,15 @@ proc open*(
   runtime: HailoRuntime,
   hefPath: string,
   profiling = false,
-  outputFormatType: hailo_format_type_t = HAILO_FORMAT_TYPE_AUTO
+  outputFormatType: hailo_format_type_t = HAILO_FORMAT_TYPE_AUTO,
+  batchSize: uint16 = uint16(HAILO_DEFAULT_BATCH_SIZE)
 ): HE[MultiOutputInference] =
   let preparedRes = MultiOutputInference.openPrepared(
     runtime,
     hefPath,
     profiling = profiling,
-    outputFormatType = outputFormatType
+    outputFormatType = outputFormatType,
+    batchSize = batchSize
   )
   if preparedRes.isErr:
     return preparedRes.error.err
@@ -436,13 +446,15 @@ proc open*(
   hefPath: string,
   schedulingAlgorithm: SchedulingAlgorithm = HAILO_SCHEDULING_ALGORITHM_NONE,
   profiling = false,
-  outputFormatType: hailo_format_type_t = HAILO_FORMAT_TYPE_AUTO
+  outputFormatType: hailo_format_type_t = HAILO_FORMAT_TYPE_AUTO,
+  batchSize: uint16 = uint16(HAILO_DEFAULT_BATCH_SIZE)
 ): HE[MultiOutputInference] =
   let preparedRes = MultiOutputInference.openPrepared(
     hefPath,
     schedulingAlgorithm,
     profiling = profiling,
-    outputFormatType = outputFormatType
+    outputFormatType = outputFormatType,
+    batchSize = batchSize
   )
   if preparedRes.isErr:
     return preparedRes.error.err
@@ -489,6 +501,12 @@ proc requestedOutputFormatType*(m: MultiOutputInference): hailo_format_type_t {.
 
 proc requestedOutputFormatName*(m: MultiOutputInference): string {.inline.} =
   formatTypeName(m.requestedOutputFormatType())
+
+proc configuredBatchSize*(m: MultiOutputInference): uint16 {.inline.} =
+  if m.isNil:
+    uint16(HAILO_DEFAULT_BATCH_SIZE)
+  else:
+    m.batchSize
 
 proc outputUserFormat*(m: MultiOutputInference; index: int): HE[Format] =
   if m.isNil:

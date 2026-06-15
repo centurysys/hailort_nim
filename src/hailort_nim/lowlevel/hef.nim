@@ -107,6 +107,31 @@ proc openHef*(buffer: openArray[byte]): HE[Hef] =
     return makeError(res, $res).err
   (Hef(hef: raw)).ok
 
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc getNetworkGroupInfos*(hef: Hef): HE[seq[NetworkGroupInfo]] =
+  if hef.isNil or hef.hef.isNil:
+    return makeError(HAILO_INVALID_ARGUMENT, "hef is nil").err
+
+  var count: csize_t = csize_t(HAILO_MAX_NETWORK_GROUPS)
+
+  while true:
+    var infos = newSeq[NetworkGroupInfo](int(count))
+    var actualCount = count
+    let res = hailo_get_network_groups_infos(hef.hef, infos[0].addr, addr actualCount)
+
+    if res == HAILO_INSUFFICIENT_BUFFER:
+      count = actualCount
+      continue
+
+    if res != HAILO_SUCCESS:
+      return makeError(res, $res).err
+
+    infos.setLen(int(actualCount))
+    return infos.ok
+
 # ==============================================================================
 # Stream / vstream infos
 # ==============================================================================

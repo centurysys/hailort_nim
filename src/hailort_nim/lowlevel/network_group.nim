@@ -82,7 +82,25 @@ proc close*(ang: ActivatedNetworkGroup): HE[void] =
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
-proc configure*(vdevice: Vdevice, hef: Hef): HE[seq[NetworkGroup]] =
+proc setBatchSize*(params: var ConfigureParams, batchSize: uint16) =
+  ## Set the same HailoRT configure-time batch size on all network groups.
+  ##
+  ## HAILO_DEFAULT_BATCH_SIZE / 0 keeps HailoRT's default behavior.
+  ## This does not change vstream frame sizes; callers should still write and
+  ## read one frame at a time.
+  let count = min(int(params.network_group_params_count), int(HAILO_MAX_NETWORK_GROUPS))
+
+  for i in 0 ..< count:
+    params.network_group_params[i].batch_size = batchSize
+
+# ------------------------------------------------------------------------------
+#
+# ------------------------------------------------------------------------------
+proc configure*(
+  vdevice: Vdevice,
+  hef: Hef,
+  batchSize: uint16 = uint16(HAILO_DEFAULT_BATCH_SIZE)
+): HE[seq[NetworkGroup]] =
   if vdevice.isNil or vdevice.rawHandle.isNil:
     return makeError(HAILO_INVALID_ARGUMENT, "vdevice is nil").err
   if hef.isNil or hef.rawHandle.isNil:
@@ -92,6 +110,9 @@ proc configure*(vdevice: Vdevice, hef: Hef): HE[seq[NetworkGroup]] =
       vdevice.rawHandle, addr params)
   if initRes != HAILO_SUCCESS:
     return makeError(initRes, $initRes).err
+
+  params.setBatchSize(batchSize)
+
   var count: csize_t = 8
   while true:
     var rawGroups = newSeq[hailo_configured_network_group](int(count))
@@ -111,8 +132,12 @@ proc configure*(vdevice: Vdevice, hef: Hef): HE[seq[NetworkGroup]] =
 # ------------------------------------------------------------------------------
 #
 # ------------------------------------------------------------------------------
-proc configureOne*(vdevice: Vdevice, hef: Hef): HE[NetworkGroup] =
-  let groupsRes = configure(vdevice, hef)
+proc configureOne*(
+  vdevice: Vdevice,
+  hef: Hef,
+  batchSize: uint16 = uint16(HAILO_DEFAULT_BATCH_SIZE)
+): HE[NetworkGroup] =
+  let groupsRes = configure(vdevice, hef, batchSize)
   if groupsRes.isErr:
     return groupsRes.error.err
   let groups = groupsRes.get

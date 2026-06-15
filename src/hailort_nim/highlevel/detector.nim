@@ -32,6 +32,7 @@ type
     outputInfo*: VstreamInfo
     inputFrameSize*: int
     outputFrameSize*: int
+    batchSize*: uint16
     profiling*: bool
     profile*: DetectorProfile
 
@@ -235,6 +236,17 @@ proc outputSize*(d: Detector): int {.inline.} =
 
 # ------------------------------------------------------------------------------
 #
+# batchSize:
+#
+# ------------------------------------------------------------------------------
+proc configuredBatchSize*(d: Detector): uint16 {.inline.} =
+  if d.isNil:
+    uint16(HAILO_DEFAULT_BATCH_SIZE)
+  else:
+    d.batchSize
+
+# ------------------------------------------------------------------------------
+#
 # isActivated:
 #
 # ------------------------------------------------------------------------------
@@ -430,6 +442,7 @@ proc close*(d: Detector): HE[void] =
   d.hef = nil
   d.runtime = nil
   d.ownsRuntime = false
+  d.batchSize = uint16(HAILO_DEFAULT_BATCH_SIZE)
 
   result = okVoid()
 
@@ -442,7 +455,8 @@ proc openPreparedWithRuntime(
   hefPath: string,
   hailoNmsScoreThreshold: float32,
   ownsRuntime: bool,
-  profiling = false
+  profiling = false,
+  batchSize: uint16 = uint16(HAILO_DEFAULT_BATCH_SIZE)
 ): HE[Detector] =
   if runtime.isNil or not runtime.isOpen():
     return makeError(HAILO_INVALID_ARGUMENT, "runtime is not open").err
@@ -462,7 +476,7 @@ proc openPreparedWithRuntime(
       discard runtime.close()
     return makeError(HAILO_INVALID_ARGUMENT, "runtime vdevice is nil").err
 
-  let ngRes = configureOne(vdevObj, hefObj)
+  let ngRes = configureOne(vdevObj, hefObj, batchSize)
   if ngRes.isErr:
     discard hefObj.close()
     if ownsRuntime:
@@ -608,6 +622,7 @@ proc openPreparedWithRuntime(
     outputInfo: outputInfo,
     inputFrameSize: inputFrameSize,
     outputFrameSize: outputFrameSize,
+    batchSize: batchSize,
     profiling: profiling,
     profile: DetectorProfile()
   ).ok
@@ -622,7 +637,8 @@ proc openPrepared*(
   runtime: HailoRuntime,
   hefPath: string,
   hailoNmsScoreThreshold = -1.0'f32,
-  profiling = false
+  profiling = false,
+  batchSize: uint16 = uint16(HAILO_DEFAULT_BATCH_SIZE)
 ): HE[Detector] =
   ## Configure HEF/vstreams on a shared runtime without activating the network.
   ##
@@ -636,7 +652,8 @@ proc openPrepared*(
     hefPath,
     hailoNmsScoreThreshold,
     ownsRuntime = false,
-    profiling = profiling
+    profiling = profiling,
+    batchSize = batchSize
   )
 
 # ------------------------------------------------------------------------------
@@ -649,7 +666,8 @@ proc openPrepared*(
   hefPath: string,
   hailoNmsScoreThreshold = -1.0'f32,
   schedulingAlgorithm: SchedulingAlgorithm = HAILO_SCHEDULING_ALGORITHM_NONE,
-  profiling = false
+  profiling = false,
+  batchSize: uint16 = uint16(HAILO_DEFAULT_BATCH_SIZE)
 ): HE[Detector] =
   ## Compatibility helper for a single prepared detector with an internally owned
   ## runtime.
@@ -663,7 +681,8 @@ proc openPrepared*(
     hefPath,
     hailoNmsScoreThreshold,
     ownsRuntime = true,
-    profiling = profiling
+    profiling = profiling,
+    batchSize = batchSize
   )
 
 # ------------------------------------------------------------------------------
@@ -675,7 +694,8 @@ proc open*(
   runtime: HailoRuntime,
   hefPath: string,
   hailoNmsScoreThreshold = -1.0'f32,
-  profiling = false
+  profiling = false,
+  batchSize: uint16 = uint16(HAILO_DEFAULT_BATCH_SIZE)
 ): HE[Detector] =
   ## Backward-compatible shared-runtime open.
   ##
@@ -685,7 +705,8 @@ proc open*(
     runtime,
     hefPath,
     hailoNmsScoreThreshold,
-    profiling = profiling
+    profiling = profiling,
+    batchSize = batchSize
   )
   if preparedRes.isErr:
     return preparedRes.error.err
@@ -708,14 +729,16 @@ proc open*(
   hefPath: string,
   hailoNmsScoreThreshold = -1.0'f32,
   schedulingAlgorithm: SchedulingAlgorithm = HAILO_SCHEDULING_ALGORITHM_NONE,
-  profiling = false
+  profiling = false,
+  batchSize: uint16 = uint16(HAILO_DEFAULT_BATCH_SIZE)
 ): HE[Detector] =
   ## Existing API: open and activate immediately.
   let preparedRes = Detector.openPrepared(
     hefPath,
     hailoNmsScoreThreshold,
     schedulingAlgorithm,
-    profiling = profiling
+    profiling = profiling,
+    batchSize = batchSize
   )
   if preparedRes.isErr:
     return preparedRes.error.err
